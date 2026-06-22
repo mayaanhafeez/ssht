@@ -1,0 +1,27 @@
+# Rust build artifacts
+/target/
+
+# Cargo.lock
+# NOTE: Cargo.lock IS committed here. ssht is a binary (not a library), and for
+# binaries the convention is to commit the lockfile so that everyone — and CI —
+# builds from the exact same dependency versions, giving reproducible builds.
+# (For libraries you'd ignore it instead.) So we deliberately do NOT ignore it.
+
+# Environment / secrets
+.env
+.env.*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor / IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude / agent files
+.claude/
+CLAUDE.local.md
