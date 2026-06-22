@@ -47,7 +47,7 @@ The result is a single static binary with no runtime dependencies beyond `ssh` a
 You need `ssh` (locally) and `tmux` (on the remote hosts) available on your `PATH`. Then build from source:
 
 ```
-git clone https://github.com/ayaanhafeez/ssht
+git clone https://github.com/mayaanhafeez/ssht
 cd ssht
 cargo install --path .
 ```
