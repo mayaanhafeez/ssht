@@ -69,15 +69,41 @@ Launch with no arguments for the fuzzy-searchable TUI:
 ssht
 ```
 
-Start typing to filter. Each entry shows the alias, the resolved endpoint, when you last connected, your connection count, and a live tmux indicator (`●` means a session is currently running on that host).
+Each entry shows the alias, the resolved endpoint, when you last connected, your connection count, and a live tmux indicator probed in the background:
+
+| Indicator | Meaning |
+| --- | --- |
+| `●` (green) | a tmux session is currently running on that host |
+| `○` | reachable, no session running |
+| `⨯` (red) | host unreachable |
+| `•` | still probing |
+
+#### Controls
+
+The picker is modal, in the spirit of vim, lazygit, and k9s. It opens in **Normal** mode for keyboard navigation; press `/` to drop into **Search** mode and fuzzy-filter.
+
+**Normal mode**
 
 | Key | Action |
 | --- | --- |
-| type | fuzzy filter |
-| `↑` / `↓`, or `Ctrl-p` / `Ctrl-n` | move selection |
-| `Enter` | connect |
-| `Ctrl-u` | clear the query |
-| `Esc` / `Ctrl-c` | quit |
+| `j` / `k` (or `↓` / `↑`) | move selection down / up |
+| `g` / `G` | jump to top / bottom |
+| `Ctrl-d` / `Ctrl-u` | half-page down / up |
+| `/`, `s`, or `i` | enter search mode |
+| `Enter` (or `l`) | connect to the selected host |
+| `q` / `Esc` / `Ctrl-c` | quit |
+
+**Search mode**
+
+| Key | Action |
+| --- | --- |
+| type | fuzzy-filter the list |
+| `Esc` | return to Normal mode (the filter is kept) |
+| `↑` / `↓`, or `Ctrl-n` / `Ctrl-p` | move selection while searching |
+| `Ctrl-w` / `Ctrl-u` | delete the last word / clear the query |
+| `Enter` | connect to the selected host |
+
+The arrow keys and `Ctrl-n` / `Ctrl-p` move the selection in both modes, so you can navigate without leaving search.
 
 ### `ssht <host>` — direct connect
 
