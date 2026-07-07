@@ -34,4 +34,31 @@ pub enum Command {
     Last,
     /// Open the ssht config file in $EDITOR.
     Edit,
+    /// Manage the encrypted settings vault (address, name, username, password).
+    Vault {
+        #[command(subcommand)]
+        action: VaultAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum VaultAction {
+    /// Create a new encrypted credential vault.
+    Init,
+    /// Store settings for a host (prompts for name, address, username, password).
+    Set {
+        /// Host alias to store settings for.
+        host: String,
+    },
+    /// Remove stored settings for a host.
+    Remove {
+        /// Host alias to remove.
+        host: String,
+    },
+    /// List all hosts that have stored settings.
+    List,
+    /// Show vault status (exists, entry count).
+    Status,
+    /// Change the vault passphrase.
+    ChangePassphrase,
 }
