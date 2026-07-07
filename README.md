@@ -91,7 +91,10 @@ The picker is modal, in the spirit of vim, lazygit, and k9s. It opens in **Norma
 | `Ctrl-d` / `Ctrl-u` | half-page down / up |
 | `/`, `s`, or `i` | enter search mode |
 | `Enter` (or `l`) | connect to the selected host |
+| `e` | edit stored settings (name, address, username, password) for the selected host |
 | `q` / `Esc` / `Ctrl-c` | quit |
+
+If the selected host has anything saved in the vault (see below) and the vault isn't unlocked yet, connecting pops up a passphrase prompt right there in the picker — it never drops you out to a bare terminal prompt.
 
 **Search mode**
 
@@ -142,6 +145,25 @@ Opens `~/.config/ssht/config.toml` in `$EDITOR` (falling back to `$VISUAL`, then
 ```
 ssht edit
 ```
+
+### `ssht vault` — stored credentials
+
+For hosts that need a password instead of a key — or where you want to override the address or username without touching `~/.ssh/config` — ssht can remember them for you, encrypted at rest with a passphrase-derived key ([age](https://github.com/str4d/rage)'s scrypt recipient).
+
+```
+ssht vault init                # create the vault (prompts to set a passphrase)
+ssht vault set <host>          # store name/address/username/password for a host
+ssht vault remove <host>       # forget a host's stored settings
+ssht vault list                # list hosts that have something stored
+ssht vault status              # check whether a vault exists
+ssht vault change-passphrase   # re-encrypt the vault under a new passphrase
+```
+
+You can also edit a host's settings straight from the picker: select it and press `e`. Fields are name, address, username, and password — any of them left blank fall back to whatever `~/.ssh/config` already has.
+
+The vault only asks for its passphrase when it actually needs to — connecting to a host with nothing stored never touches it. When it does need to unlock, that happens as a popup right inside the picker, not a plain terminal prompt. Once unlocked, it stays that way for the rest of the run, so it won't ask again for a second host in the same session.
+
+The vault file lives at `~/.config/ssht/vault.age` (honoring `$XDG_CONFIG_HOME`, or override the path with `$SSHT_VAULT_FILE`). A small sidecar index (`vault.idx`) sits alongside it, listing which aliases have something stored — just the names, no secrets — so ssht can decide whether to prompt at all without decrypting anything.
 
 ## Configuration
 

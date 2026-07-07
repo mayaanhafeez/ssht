@@ -36,7 +36,9 @@ pub fn connect(
         .record_connection(alias)
         .with_context(|| format!("recording connection to {alias}"))?;
 
-    vault.ensure_unlocked().context("unlocking vault")?;
+    if vault.might_have_settings(alias)? {
+        vault.ensure_unlocked().context("unlocking vault")?;
+    }
     let settings = vault.get_settings(alias)?;
 
     let mut cmd = Command::new("ssh");

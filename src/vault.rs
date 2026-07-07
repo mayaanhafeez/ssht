@@ -26,6 +26,16 @@ struct VaultContentV1 {
     hosts: HashMap<String, String>,
 }
 
+/// Plaintext sidecar listing which aliases have vault entries (names only,
+/// no secrets). Lets callers check "does this alias have stored settings?"
+/// without unlocking the vault, so we don't prompt for the passphrase on
+/// every connection.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct VaultIndex {
+    #[serde(default)]
+    aliases: Vec<String>,
+}
+
 pub struct Vault {
     path: PathBuf,
     passphrase: String,
@@ -52,6 +62,41 @@ impl Vault {
         Ok(Self::vault_path()?.exists())
     }
 
+    fn index_path_for(vault_path: &PathBuf) -> PathBuf {
+        vault_path.with_extension("idx")
+    }
+
+    /// Returns true if the on-disk vault appears to have an entry for
+    /// `alias`, without requiring the passphrase. If the vault doesn't
+    /// exist, returns false. If the vault exists but predates the alias
+    /// index (or the index is unreadable), conservatively returns true so a
+    /// real stored password is never silently skipped — the index is
+    /// (re)written the next time the vault is opened or saved.
+    pub fn alias_hint_exists(alias: &str) -> Result<bool> {
+        let vault_path = Self::vault_path()?;
+        if !vault_path.exists() {
+            return Ok(false);
+        }
+        match std::fs::read_to_string(Self::index_path_for(&vault_path)) {
+            Ok(text) => {
+                let index: VaultIndex = toml::from_str(&text).unwrap_or_default();
+                Ok(index.aliases.iter().any(|a| a == alias))
+            }
+            Err(_) => Ok(true),
+        }
+    }
+
+    fn write_index(&self) -> Result<()> {
+        let mut aliases: Vec<String> = self.entries.keys().cloned().collect();
+        aliases.sort();
+        let index_path = Self::index_path_for(&self.path);
+        let text = toml::to_string(&VaultIndex { aliases })
+            .context("serializing vault index")?;
+        std::fs::write(&index_path, text)
+            .with_context(|| format!("writing vault index to {}", index_path.display()))?;
+        Ok(())
+    }
+
     pub fn init(passphrase: &str) -> Result<Vault> {
         let path = Self::vault_path()?;
         if let Some(parent) = path.parent() {
@@ -71,7 +116,9 @@ impl Vault {
             .context("encrypting vault")?;
         std::fs::write(&path, &encrypted)
             .with_context(|| format!("writing vault to {}", path.display()))?;
-        Ok(Vault { path, passphrase: passphrase.to_string(), entries: HashMap::new() })
+        let vault = Vault { path, passphrase: passphrase.to_string(), entries: HashMap::new() };
+        vault.write_index()?;
+        Ok(vault)
     }
 
     pub fn open(passphrase: &str) -> Result<Vault> {
@@ -93,7 +140,10 @@ impl Vault {
             }
         };
 
-        Ok(Vault { path, passphrase: passphrase.to_string(), entries })
+        let vault = Vault { path, passphrase: passphrase.to_string(), entries };
+        // Self-heal the alias index (covers vaults created before it existed).
+        vault.write_index()?;
+        Ok(vault)
     }
 
     pub fn change_passphrase(&mut self, new_passphrase: &str) -> Result<()> {
@@ -140,6 +190,7 @@ impl Vault {
             .context("encrypting vault")?;
         std::fs::write(&self.path, &encrypted)
             .with_context(|| format!("writing vault to {}", self.path.display()))?;
+        self.write_index()?;
         Ok(())
     }
 
@@ -206,6 +257,17 @@ impl LazyVault {
     /// is locked or doesn't exist, or if the alias has no stored settings.
     pub fn get_settings(&mut self, alias: &str) -> Result<Option<HostSettings>> {
         Ok(self.vault.as_ref().and_then(|v| v.get_settings(alias)).cloned())
+    }
+
+    /// Returns true if `alias` might have stored settings, without prompting
+    /// for the passphrase. If already unlocked, this is exact; otherwise it
+    /// consults the on-disk alias index. Callers should use this to decide
+    /// whether unlocking (and thus prompting) is worthwhile at all.
+    pub fn might_have_settings(&self, alias: &str) -> Result<bool> {
+        match &self.vault {
+            Some(v) => Ok(v.get_settings(alias).is_some()),
+            None => Vault::alias_hint_exists(alias),
+        }
     }
 
     /// Returns `true` if the vault file exists but is not yet unlocked.
@@ -354,16 +416,18 @@ pub fn prompt_passphrase(prompt: &str) -> Result<String> {
 
 
 
+/// Test helper shared across modules (e.g. `picker`'s tests) that need a
+/// throwaway vault on disk without touching the user's real one.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
     use std::sync::Mutex;
 
-    /// Serialize tests that modify SSHT_VAULT_FILE env var.
+    /// Serialize tests that modify the SSHT_VAULT_FILE env var, since it's
+    /// process-global and cargo runs tests in parallel threads.
     static VAULT_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// Set up the vault file path to a temp dir and run the test closure.
-    fn with_temp_vault<F>(f: F)
+    pub(crate) fn with_temp_vault<F>(f: F)
     where
         F: FnOnce(),
     {
@@ -386,6 +450,12 @@ mod tests {
             }
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::test_support::with_temp_vault;
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
@@ -451,6 +521,26 @@ mod tests {
             let reopened = Vault::open("mypass").unwrap();
             assert_eq!(reopened.len(), 1);
             assert_eq!(pw(reopened.get_settings("db-primary").unwrap()), Some("p@ss"));
+        });
+    }
+
+    #[test]
+    fn test_alias_hint_avoids_unnecessary_unlock() {
+        with_temp_vault(|| {
+            // No vault at all: no hint, no unlock needed.
+            assert!(!Vault::alias_hint_exists("prod-web").unwrap());
+
+            let mut vault = Vault::init("mypass").unwrap();
+            let s = HostSettings { password: Some("s3cret!".into()), ..Default::default() };
+            vault.set_settings("prod-web", s).unwrap();
+
+            // Vault exists and has an index: only the stored alias hints true.
+            assert!(Vault::alias_hint_exists("prod-web").unwrap());
+            assert!(!Vault::alias_hint_exists("no-such-host").unwrap());
+
+            let mut lazy = LazyVault::new();
+            assert!(lazy.might_have_settings("prod-web").unwrap());
+            assert!(!lazy.might_have_settings("no-such-host").unwrap());
         });
     }
 

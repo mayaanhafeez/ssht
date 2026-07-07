@@ -3,8 +3,9 @@
 //! Modes:
 //!   * **Normal** — navigate, `⏎` connect, `e` settings, `q` quit.
 //!   * **Search** — type to fuzzy-filter; `Esc` returns to Normal.
-//!   * **VaultUnlock** — enter vault passphrase (triggered when editing or
-//!     saving the password field with a locked vault).
+//!   * **VaultUnlock** — enter vault passphrase, shown as an in-TUI popup
+//!     (triggered when connecting to, editing, or saving settings for a host
+//!     that needs a locked vault).
 //!   * **Settings** — edit name, address, username, password for a host.
 
 use anyhow::Result;
@@ -49,18 +50,30 @@ struct SettingsField {
 
 struct SettingsData {
     fields: Vec<SettingsField>,
+    /// Field values as loaded when this settings screen was opened, used to
+    /// detect real changes on exit (rather than a stateful dirty flag, which
+    /// stayed true even if an edit was typed and then undone).
+    originals: Vec<String>,
     selected: usize,
     editing: bool,
-    dirty: bool,
+}
+
+/// What to do once the vault unlock popup succeeds.
+#[derive(Clone)]
+enum VaultUnlockAction {
+    /// Re-enter settings mode to reload the password field for `host_idx`.
+    ReenterSettings,
+    /// Save these settings for `alias`.
+    Save(String, HostSettings),
+    /// Exit the picker and connect to `alias`.
+    Connect(String),
 }
 
 struct VaultUnlockData {
     passphrase: String,
     error: Option<String>,
     host_idx: usize,
-    /// If set, save these settings after unlocking. Otherwise re-enter settings
-    /// for the host (to reload the password from the now-unlocked vault).
-    pending_save: Option<(String, HostSettings)>,
+    action: VaultUnlockAction,
 }
 
 struct App {
@@ -75,6 +88,10 @@ struct App {
     viewport: usize,
     settings: Option<SettingsData>,
     vault_unlock: Option<VaultUnlockData>,
+    /// Set by `try_connect` after a vault unlock popup succeeds; the run
+    /// loop picks this up to exit and connect, since the unlock happens
+    /// several calls deep inside the key-handling chain.
+    connect_target: Option<String>,
     vault: *mut LazyVault,
 }
 
@@ -92,6 +109,7 @@ impl App {
             viewport: 10,
             settings: None,
             vault_unlock: None,
+            connect_target: None,
             vault,
         };
         app.recompute();
@@ -186,20 +204,48 @@ impl App {
 
         let mut fields = fields;
         for f in &mut fields { f.saved = f.value.clone(); }
+        let originals = fields.iter().map(|f| f.value.clone()).collect();
 
         self.settings = Some(SettingsData {
             fields,
+            originals,
             selected: 0,
             editing: false,
-            dirty: false,
         });
         self.mode = Mode::Settings;
     }
 
+    /// Connect to the currently selected host, popping up the vault-unlock
+    /// prompt first if that host might have vault settings and the vault
+    /// isn't unlocked yet — instead of exiting the TUI to a bare terminal
+    /// prompt.
+    fn try_connect(&mut self) -> Option<KeyOutcome> {
+        let Some(alias) = self.selected_alias() else {
+            return Some(KeyOutcome::Exit(None));
+        };
+        let vault = unsafe { &mut *self.vault };
+        let needs_unlock = !vault.is_unlocked()
+            && vault.might_have_settings(&alias).unwrap_or(true);
+
+        if needs_unlock {
+            let host_idx = *self.filtered.get(self.selected).unwrap_or(&0);
+            self.vault_unlock = Some(VaultUnlockData {
+                passphrase: String::new(),
+                error: None,
+                host_idx,
+                action: VaultUnlockAction::Connect(alias),
+            });
+            self.mode = Mode::VaultUnlock;
+            None
+        } else {
+            Some(KeyOutcome::Exit(Some(alias)))
+        }
+    }
+
     /// Try to unlock with the given passphrase.
     fn try_unlock(&mut self, passphrase: &str) {
-        let (host_idx, pending_save) = match self.vault_unlock.as_ref() {
-            Some(d) => (d.host_idx, d.pending_save.clone()),
+        let (host_idx, action) = match self.vault_unlock.as_ref() {
+            Some(d) => (d.host_idx, d.action.clone()),
             None => return,
         };
 
@@ -209,35 +255,41 @@ impl App {
                 unsafe { (*vault_ptr).inject(vault); }
                 self.vault_unlock = None;
 
-                if let Some((alias, hs)) = pending_save {
-                    // Save settings after unlock.
-                    let vault = unsafe { &mut *self.vault };
-                    if let Err(e) = vault.set_settings_data(&alias, hs) {
-                        self.vault_unlock = Some(VaultUnlockData {
-                            passphrase: String::new(),
-                            error: Some(format!("{e:#}")),
-                            host_idx,
-                            pending_save: None,
-                        });
-                        return;
+                match action {
+                    VaultUnlockAction::Save(alias, hs) => {
+                        let vault = unsafe { &mut *self.vault };
+                        if let Err(e) = vault.set_settings_data(&alias, hs) {
+                            self.vault_unlock = Some(VaultUnlockData {
+                                passphrase: String::new(),
+                                error: Some(format!("{e:#}")),
+                                host_idx,
+                                action: VaultUnlockAction::ReenterSettings,
+                            });
+                            return;
+                        }
+                        self.mode = Mode::Normal;
                     }
-                    self.mode = Mode::Normal;
-                } else {
-                    // Re-enter settings mode to load password from vault.
-                    self.enter_settings_for(host_idx);
-                    // Start editing the password field.
-                    if let Some(ref mut s) = self.settings {
-                        s.selected = 3;
-                        s.editing = true;
-                        if s.fields[3].value.is_empty() {
-                            // Load password from vault now that it's unlocked.
-                            let vault = unsafe { &mut *self.vault };
-                            if let Ok(Some(stored)) = vault.get_settings(
-                                &self.hosts[host_idx].alias
-                            ) {
-                                if let Some(pw) = &stored.password {
-                                    s.fields[3].value.clone_from(pw);
-                                    s.fields[3].saved.clone_from(pw);
+                    VaultUnlockAction::Connect(alias) => {
+                        self.mode = Mode::Normal;
+                        self.connect_target = Some(alias);
+                    }
+                    VaultUnlockAction::ReenterSettings => {
+                        // Re-enter settings mode to load password from vault.
+                        self.enter_settings_for(host_idx);
+                        // Start editing the password field.
+                        if let Some(ref mut s) = self.settings {
+                            s.selected = 3;
+                            s.editing = true;
+                            if s.fields[3].value.is_empty() {
+                                // Load password from vault now that it's unlocked.
+                                let vault = unsafe { &mut *self.vault };
+                                if let Ok(Some(stored)) = vault.get_settings(
+                                    &self.hosts[host_idx].alias
+                                ) {
+                                    if let Some(pw) = &stored.password {
+                                        s.fields[3].value.clone_from(pw);
+                                        s.fields[3].saved.clone_from(pw);
+                                    }
                                 }
                             }
                         }
@@ -253,9 +305,10 @@ impl App {
         }
     }
 
-    /// Leave settings mode. If dirty and vault is unlocked, save directly.
-    /// If dirty and vault is locked, enter VaultUnlock. If no vault and no
-    /// password, skip. If no vault and password set, terminal-prompt creation.
+    /// Leave settings mode. If anything actually changed and vault is
+    /// unlocked, save directly. If changed and vault is locked, enter
+    /// VaultUnlock. If no vault and no password, skip. If no vault and
+    /// password set, terminal-prompt creation.
     fn leave_settings(&mut self) {
         let Some(settings) = self.settings.take() else {
             self.mode = Mode::Normal;
@@ -267,7 +320,9 @@ impl App {
         };
         let alias = self.hosts[host_idx].alias.clone();
 
-        if !settings.dirty {
+        let changed = settings.fields.iter().zip(settings.originals.iter())
+            .any(|(f, orig)| &f.value != orig);
+        if !changed {
             self.mode = Mode::Normal;
             return;
         }
@@ -290,7 +345,7 @@ impl App {
                     passphrase: String::new(),
                     error: Some(format!("{e:#}")),
                     host_idx,
-                    pending_save: None,
+                    action: VaultUnlockAction::ReenterSettings,
                 });
                 self.mode = Mode::VaultUnlock;
                 return;
@@ -305,7 +360,7 @@ impl App {
                 passphrase: String::new(),
                 error: None,
                 host_idx,
-                pending_save: Some((alias, hs)),
+                action: VaultUnlockAction::Save(alias, hs),
             });
             self.mode = Mode::VaultUnlock;
             return;
@@ -381,6 +436,9 @@ pub fn run_picker(
             match app.mode {
                 Mode::VaultUnlock => {
                     handle_vault_unlock_key(&mut app, key.code);
+                    if let Some(alias) = app.connect_target.take() {
+                        break Some(alias);
+                    }
                     continue;
                 }
                 Mode::Settings => {
@@ -391,7 +449,11 @@ pub fn run_picker(
             }
 
             match key.code {
-                KeyCode::Enter => break app.selected_alias(),
+                KeyCode::Enter => {
+                    if let Some(KeyOutcome::Exit(alias)) = app.try_connect() {
+                        break alias;
+                    }
+                }
                 KeyCode::Char('c' | 'g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     break None;
                 }
@@ -436,7 +498,7 @@ fn handle_mode_key(app: &mut App, code: KeyCode, _ctrl: bool) -> Option<KeyOutco
             KeyCode::Char('k') => app.move_by(-1),
             KeyCode::Char('g') => app.to_top(),
             KeyCode::Char('G') => app.to_bottom(),
-            KeyCode::Char('l') => return Some(KeyOutcome::Exit(app.selected_alias())),
+            KeyCode::Char('l') => return app.try_connect(),
             KeyCode::Char('/' | 's' | 'i') => app.mode = Mode::Search,
             KeyCode::Char('e') => {
                 if let Some(&idx) = app.filtered.get(app.selected) {
@@ -485,7 +547,11 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
 
     if settings.editing {
         match code {
-            KeyCode::Enter => settings.editing = false,
+            KeyCode::Enter => {
+                let idx = settings.selected;
+                settings.fields[idx].saved = settings.fields[idx].value.clone();
+                settings.editing = false;
+            }
             KeyCode::Esc => {
                 let idx = settings.selected;
                 settings.fields[idx].value = settings.fields[idx].saved.clone();
@@ -494,14 +560,10 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
             KeyCode::Char(c) => {
                 let idx = settings.selected;
                 settings.fields[idx].value.push(c);
-                settings.dirty = true;
-                settings.fields[idx].saved = settings.fields[idx].value.clone();
             }
             KeyCode::Backspace => {
                 let idx = settings.selected;
                 settings.fields[idx].value.pop();
-                settings.dirty = true;
-                settings.fields[idx].saved = settings.fields[idx].value.clone();
             }
             _ => {}
         }
@@ -527,7 +589,7 @@ fn handle_settings_key(app: &mut App, code: KeyCode) {
                             passphrase: String::new(),
                             error: None,
                             host_idx,
-                            pending_save: None,
+                            action: VaultUnlockAction::ReenterSettings,
                         });
                         app.mode = Mode::VaultUnlock;
                         return;
@@ -645,13 +707,16 @@ fn centered_rect(r: ratatui::layout::Rect, pct_x: u16, pct_y: u16) -> ratatui::l
 
 fn render_vault_unlock_overlay(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let Some(ref data) = app.vault_unlock else { return };
-    let has_pending = data.pending_save.is_some();
     frame.render_widget(Clear, area);
 
     let popup = centered_rect(area, 50, 25);
     frame.render_widget(Clear, popup);
 
-    let title = if has_pending { " Vault passphrase (save) " } else { " Vault passphrase " };
+    let title = match data.action {
+        VaultUnlockAction::Save(..) => " Vault passphrase (save) ",
+        VaultUnlockAction::Connect(..) => " Vault passphrase (connect) ",
+        VaultUnlockAction::ReenterSettings => " Vault passphrase ",
+    };
     let block = Block::default()
         .borders(Borders::ALL).border_type(BorderType::Rounded)
         .border_style(Style::default().fg(ACCENT))
@@ -920,6 +985,86 @@ mod tests {
         assert_eq!(s.fields[1].value, "db.internal");
         assert_eq!(s.fields[2].value, "");
         assert!(s.fields[3].value.is_empty()); // locked vault => pw blank
+    }
+
+    #[test]
+    fn esc_during_edit_reverts_uncommitted_typing() {
+        let mut vault = LazyVault::new();
+        let mut app = App::new(sample_hosts(), &mut vault);
+        app.selected = 0;
+        handle_key(&mut app, KeyCode::Char('e'), false);
+        // Select and start editing the Address field (index 1).
+        handle_settings_key(&mut app, KeyCode::Char('j'));
+        handle_settings_key(&mut app, KeyCode::Enter);
+        assert!(app.settings.as_ref().unwrap().editing);
+        for c in "extra".chars() {
+            handle_settings_key(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.settings.as_ref().unwrap().fields[1].value, "db.internalextra");
+        handle_settings_key(&mut app, KeyCode::Esc);
+        assert!(!app.settings.as_ref().unwrap().editing);
+        assert_eq!(app.settings.as_ref().unwrap().fields[1].value, "db.internal");
+    }
+
+    #[test]
+    fn typing_then_undoing_leaves_no_net_change() {
+        let mut vault = LazyVault::new();
+        let mut app = App::new(sample_hosts(), &mut vault);
+        app.selected = 0;
+        handle_key(&mut app, KeyCode::Char('e'), false);
+        handle_settings_key(&mut app, KeyCode::Enter); // edit Name field
+        handle_settings_key(&mut app, KeyCode::Char('x'));
+        handle_settings_key(&mut app, KeyCode::Backspace);
+        handle_settings_key(&mut app, KeyCode::Enter); // confirm edit
+        let settings = app.settings.as_ref().unwrap();
+        let changed = settings.fields.iter().zip(settings.originals.iter())
+            .any(|(f, orig)| &f.value != orig);
+        assert!(!changed, "typing a char and backspacing it should not register as a change");
+    }
+
+    #[test]
+    fn connecting_to_vaulted_host_pops_up_unlock_instead_of_exiting() {
+        use crate::vault::test_support::with_temp_vault;
+
+        with_temp_vault(|| {
+            let mut vault = crate::vault::Vault::init("testpass").unwrap();
+            let settings = HostSettings {
+                password: Some("s3cret".into()),
+                ..Default::default()
+            };
+            vault.set_settings("db", settings).unwrap();
+
+            let mut lazy = LazyVault::new();
+            let mut app = App::new(sample_hosts(), &mut lazy);
+            let select_alias = |app: &mut App, alias: &str| {
+                app.selected = app.filtered.iter()
+                    .position(|&i| app.hosts[i].alias == alias)
+                    .expect("alias present in filtered list");
+            };
+
+            select_alias(&mut app, "db"); // has vault settings
+
+            // Enter/'l' should NOT exit the picker straight away — it should
+            // pop up the vault-unlock prompt instead of dropping to a bare
+            // terminal password prompt.
+            let outcome = app.try_connect();
+            assert_eq!(outcome, None);
+            assert_eq!(app.mode, Mode::VaultUnlock);
+            assert!(app.vault_unlock.is_some());
+
+            // A host with no vault settings should connect immediately with
+            // no unlock popup at all.
+            select_alias(&mut app, "prod-web"); // no vault entry
+            let outcome = app.try_connect();
+            assert_eq!(outcome, Some(KeyOutcome::Exit(Some("prod-web".into()))));
+            assert_eq!(app.mode, Mode::VaultUnlock, "unrelated in-progress unlock is untouched");
+
+            // Now actually unlock "db"'s pending prompt and confirm the loop
+            // gets told to exit and connect.
+            app.try_unlock("testpass");
+            assert_eq!(app.connect_target.as_deref(), Some("db"));
+            assert_eq!(app.mode, Mode::Normal);
+        });
     }
 
     #[test]
