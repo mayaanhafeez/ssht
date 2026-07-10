@@ -44,7 +44,21 @@ The result is a single static binary with no runtime dependencies beyond `ssh` a
 
 ## Installation
 
-You need `ssh` (locally) and `tmux` (on the remote hosts) available on your `PATH`. Then build from source:
+You need `ssh` (locally) and `tmux` (on the remote hosts) available on your `PATH`.
+
+**Homebrew:**
+
+```
+brew install mayaanhafeez/tap/ssht
+```
+
+**crates.io:**
+
+```
+cargo install ssht
+```
+
+**From source:**
 
 ```
 git clone https://github.com/mayaanhafeez/ssht
