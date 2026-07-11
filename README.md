@@ -46,6 +46,17 @@ The result is a single static binary with no runtime dependencies beyond `ssh` a
 
 You need `ssh` (locally) and `tmux` (on the remote hosts) available on your `PATH`.
 
+### Supported platforms
+
+| Platform | Install methods | Notes |
+| --- | --- | --- |
+| macOS | Homebrew, crates.io, from source | Any architecture — these all build locally |
+| Linux (any distro) | crates.io, Nix, from source | Any architecture — these all build locally |
+| Arch Linux | pacman (`.pkg.tar.zst`) | Prebuilt package is x86_64 only; build with `makepkg` on other architectures |
+| Debian / Ubuntu | `.deb` | Prebuilt package is x86_64 only |
+| Fedora / RHEL | `.rpm` | Prebuilt package is x86_64 only |
+| Windows | — | Not currently packaged or tested. `cargo install ssht` may work since ssht only shells out to `ssh` locally, but it's unverified — issue reports welcome |
+
 **Homebrew** (macOS and Linux):
 
 ```
