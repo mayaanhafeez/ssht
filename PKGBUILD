@@ -1,6 +1,6 @@
 # Maintainer: Ayaan Hafeez <m.ayaan.hafeez@gmail.com>
 pkgname=ssht
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Smart SSH session manager that auto-attaches to persistent tmux sessions"
 arch=('x86_64' 'aarch64')
