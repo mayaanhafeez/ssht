@@ -26,3 +26,27 @@ shellexpand = "3.1.2"
 tempfile = "3"
 tokio = { version = "1.52.3", features = ["full"] }
 toml = "1.1.2"
+
+[package.metadata.deb]
+maintainer = "Ayaan Hafeez <m.ayaan.hafeez@gmail.com>"
+copyright = "2026, Ayaan Hafeez <m.ayaan.hafeez@gmail.com>"
+section = "utils"
+priority = "optional"
+depends = "$auto"
+extended-description = """\
+ssht turns every SSH connection into a persistent tmux session. Connect, \
+disconnect, reconnect from another machine, and the session -- running jobs \
+and all -- is exactly where you left it. Includes a fuzzy-searchable picker \
+built from your existing ~/.ssh/config."""
+assets = [
+    ["target/release/ssht", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/ssht/README.md", "644"],
+    ["LICENSE", "usr/share/doc/ssht/LICENSE", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/ssht", dest = "/usr/bin/ssht", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/ssht/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/ssht/LICENSE", mode = "644", doc = true },
+]

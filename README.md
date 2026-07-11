@@ -46,16 +46,55 @@ The result is a single static binary with no runtime dependencies beyond `ssh` a
 
 You need `ssh` (locally) and `tmux` (on the remote hosts) available on your `PATH`.
 
-**Homebrew:**
+**Homebrew** (macOS and Linux):
 
 ```
 brew install mayaanhafeez/tap/ssht
 ```
 
-**crates.io:**
+**crates.io** (macOS, Linux, and anywhere else Rust runs):
 
 ```
 cargo install ssht
+```
+
+**Nix:**
+
+```
+nix run github:mayaanhafeez/ssht
+# or, to install it into your profile:
+nix profile install github:mayaanhafeez/ssht
+```
+
+**Arch Linux (pacman):**
+
+Every [release](https://github.com/mayaanhafeez/ssht/releases) includes a prebuilt `.pkg.tar.zst`:
+
+```
+curl -LO https://github.com/mayaanhafeez/ssht/releases/latest/download/ssht-<version>-1-x86_64.pkg.tar.zst
+sudo pacman -U ssht-<version>-1-x86_64.pkg.tar.zst
+```
+
+Or build it yourself from the [`PKGBUILD`](PKGBUILD) at the root of this repo:
+
+```
+git clone https://github.com/mayaanhafeez/ssht
+cd ssht
+makepkg -si
+```
+
+**Debian / Ubuntu (.deb):**
+
+```
+curl -LO https://github.com/mayaanhafeez/ssht/releases/latest/download/ssht_<version>-1_amd64.deb
+sudo apt install ./ssht_<version>-1_amd64.deb
+```
+
+**Fedora / RHEL (.rpm):**
+
+```
+curl -LO https://github.com/mayaanhafeez/ssht/releases/latest/download/ssht-<version>-1.x86_64.rpm
+sudo dnf install ./ssht-<version>-1.x86_64.rpm
 ```
 
 **From source:**
