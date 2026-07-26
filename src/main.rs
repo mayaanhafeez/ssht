@@ -33,9 +33,14 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Command::List) => cmd_list(&config, &state),
-        Some(Command::Last) => {
-            cmd_last(&config, &state, cli.layout.as_deref(), &cli.ssh_args, &mut vault)
-        }
+        Some(Command::Last) => cmd_last(
+            &config,
+            &state,
+            cli.layout.as_deref(),
+            &cli.ssh_args,
+            &mut vault,
+            cli.scrollback,
+        ),
         Some(Command::Edit) => cmd_edit(),
         Some(Command::Vault { action }) => cmd_vault(action),
         None => match cli.host {
@@ -46,8 +51,17 @@ async fn main() -> Result<()> {
                 cli.layout.as_deref(),
                 &cli.ssh_args,
                 &mut vault,
+                cli.scrollback,
             ),
-            None => cmd_picker(&config, &state, cli.layout.as_deref(), &cli.ssh_args, &mut vault).await,
+            None => cmd_picker(
+                &config,
+                &state,
+                cli.layout.as_deref(),
+                &cli.ssh_args,
+                &mut vault,
+                cli.scrollback,
+            )
+            .await,
         },
     }
 }
@@ -161,11 +175,12 @@ fn cmd_last(
     layout: Option<&str>,
     ssh_args: &[String],
     vault: &mut LazyVault,
+    scrollback: Option<u32>,
 ) -> Result<()> {
     match state.last_host()? {
         Some(alias) => {
             eprintln!("Reconnecting to {alias}…");
-            connect::connect(&alias, config, state, layout, ssh_args, vault)
+            connect::connect(&alias, config, state, layout, ssh_args, vault, scrollback)
         }
         None => {
             anyhow::bail!("no previous connection recorded yet");
@@ -194,6 +209,7 @@ async fn cmd_picker(
     layout: Option<&str>,
     ssh_args: &[String],
     vault: &mut LazyVault,
+    scrollback: Option<u32>,
 ) -> Result<()> {
     let hosts = load_hosts(config, state)?;
     if hosts.is_empty() {
@@ -211,7 +227,9 @@ async fn cmd_picker(
         .context("picker failed")?;
 
     match selection {
-        Some(alias) => connect::connect(&alias, config, state, layout, ssh_args, vault),
+        Some(alias) => {
+            connect::connect(&alias, config, state, layout, ssh_args, vault, scrollback)
+        }
         None => Ok(()),
     }
 }

@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub layout: Option<String>,
 
+    /// Replay this many lines of history on attach, overriding the config.
+    #[arg(long, value_name = "N")]
+    pub scrollback: Option<u32>,
+
     /// Extra arguments passed directly to `ssh` (everything after `--`).
     #[arg(last = true, value_name = "SSH_ARGS")]
     pub ssh_args: Vec<String>,

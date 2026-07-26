@@ -19,6 +19,7 @@ pub fn connect(
     layout_override: Option<&str>,
     ssh_passthrough: &[String],
     vault: &mut LazyVault,
+    scrollback: Option<u32>,
 ) -> Result<()> {
     let session = config.session_for(alias);
     let layout = config.resolve_layout(alias, layout_override);
@@ -30,7 +31,8 @@ pub fn connect(
         );
     }
 
-    let remote = tmux::build_remote_command(&session, layout);
+    let scrollback_lines = scrollback.unwrap_or(config.settings.scrollback_lines);
+    let remote = tmux::build_remote_command(&session, layout, scrollback_lines);
 
     state
         .record_connection(alias)

@@ -22,12 +22,21 @@ pub struct Config {
 pub struct Settings {
     /// Default tmux session name when a host doesn't override it.
     pub default_session: String,
+    /// Lines of tmux history to replay into the local terminal on attach, so
+    /// native scrollback works. 0 disables it.
+    ///
+    /// Off by default: the replay is a one-shot dump with no memory of what a
+    /// client has already seen, so reattaching repeatedly prints the same tail
+    /// again each time. Fixing that needs per-client sequence tracking, which
+    /// needs a daemon that outlives the connection.
+    pub scrollback_lines: u32,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             default_session: "main".to_string(),
+            scrollback_lines: 0,
         }
     }
 }
@@ -125,6 +134,11 @@ const STARTER_CONFIG: &str = r#"# ssht configuration
 [settings]
 # Default tmux session name used when a host doesn't override it.
 default_session = "main"
+
+# Replay this many lines of tmux history into your terminal when attaching, so
+# your terminal's own scrollback works after reconnecting. 0 disables it.
+# Note that reattaching repeatedly re-prints the same tail each time.
+# scrollback_lines = 1000
 
 # Per-host metadata. Keys are ssh aliases (as in ~/.ssh/config).
 # [hosts.prod-web]
