@@ -19,7 +19,8 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 use crate::cli::{Cli, Command, VaultAction};
-use crate::config::Config;
+use crate::config::{Config, Forwards};
+use crate::connect::ConnectOptions;
 use crate::model::{merge_hosts, Host};
 use crate::state::State;
 use crate::vault::{HostSettings, LazyVault, Vault};
@@ -32,6 +33,15 @@ async fn main() -> Result<()> {
     let state = State::open().context("opening state database")?;
     let mut vault = LazyVault::new();
 
+    let opts = ConnectOptions {
+        no_reconnect: cli.no_reconnect,
+        forwards: Forwards {
+            local: cli.local_forward.clone(),
+            remote: cli.remote_forward.clone(),
+            dynamic: cli.dynamic_forward.clone(),
+        },
+    };
+
     match cli.command {
         Some(Command::List) => cmd_list(&config, &state),
         Some(Command::Last) => cmd_last(
@@ -40,7 +50,7 @@ async fn main() -> Result<()> {
             cli.layout.as_deref(),
             &cli.ssh_args,
             &mut vault,
-            cli.no_reconnect,
+            &opts,
         ),
         Some(Command::Edit) => cmd_edit(),
         Some(Command::Sessions { host }) => cmd_sessions(&host, &mut vault),
@@ -61,7 +71,7 @@ async fn main() -> Result<()> {
                 cli.layout.as_deref(),
                 &cli.ssh_args,
                 &mut vault,
-                cli.no_reconnect,
+                &opts,
             ),
             None => cmd_picker(
                 &config,
@@ -69,7 +79,7 @@ async fn main() -> Result<()> {
                 cli.layout.as_deref(),
                 &cli.ssh_args,
                 &mut vault,
-                cli.no_reconnect,
+                &opts,
             )
             .await,
         },
@@ -185,12 +195,12 @@ fn cmd_last(
     layout: Option<&str>,
     ssh_args: &[String],
     vault: &mut LazyVault,
-    no_reconnect: bool,
+    opts: &ConnectOptions,
 ) -> Result<()> {
     match state.last_host()? {
         Some(alias) => {
             eprintln!("Reconnecting to {alias}…");
-            connect::connect(&alias, config, state, layout, ssh_args, vault, no_reconnect)
+            connect::connect(&alias, config, state, layout, ssh_args, vault, opts)
         }
         None => {
             anyhow::bail!("no previous connection recorded yet");
@@ -266,7 +276,7 @@ async fn cmd_picker(
     layout: Option<&str>,
     ssh_args: &[String],
     vault: &mut LazyVault,
-    no_reconnect: bool,
+    opts: &ConnectOptions,
 ) -> Result<()> {
     let hosts = load_hosts(config, state)?;
     if hosts.is_empty() {
@@ -284,15 +294,9 @@ async fn cmd_picker(
         .context("picker failed")?;
 
     match selection {
-        Some(alias) => connect::connect(
-            &alias,
-            config,
-            state,
-            layout,
-            ssh_args,
-            vault,
-            no_reconnect,
-        ),
+        Some(alias) => {
+            connect::connect(&alias, config, state, layout, ssh_args, vault, opts)
+        }
         None => Ok(()),
     }
 }

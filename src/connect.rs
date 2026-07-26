@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
+use crate::config::{Config, Forwards};
 use crate::state::State;
 use crate::tmux;
 use crate::vault::{self, LazyVault};
@@ -53,6 +53,18 @@ impl ReconnectPolicy {
     }
 }
 
+/// Everything the caller can vary about a single connection. Collected into a
+/// struct because these arrive from several independent places — flags, config,
+/// the picker — and threading them as positional parameters made every call
+/// site a wall of bare booleans.
+#[derive(Debug, Default, Clone)]
+pub struct ConnectOptions {
+    /// Exit when the transport drops instead of re-attaching.
+    pub no_reconnect: bool,
+    /// Port forwards from the command line, merged with configured ones.
+    pub forwards: Forwards,
+}
+
 /// Connect to `alias`: ssh in and attach/create the tmux session.
 /// If the vault contains settings for `alias` (address, username, password),
 /// those override the alias and are passed to `ssh`.
@@ -68,7 +80,7 @@ pub fn connect(
     layout_override: Option<&str>,
     ssh_passthrough: &[String],
     vault: &mut LazyVault,
-    no_reconnect: bool,
+    opts: &ConnectOptions,
 ) -> Result<()> {
     let session = config.session_for(alias);
     let layout = config.resolve_layout(alias, layout_override);
@@ -81,7 +93,8 @@ pub fn connect(
     }
 
     let remote = tmux::build_remote_command(&session, layout);
-    let policy = ReconnectPolicy::from_config(config, no_reconnect);
+    let policy = ReconnectPolicy::from_config(config, opts.no_reconnect);
+    let forward_args = config.forward_args(alias, &opts.forwards)?;
 
     state
         .record_connection(alias)
@@ -107,6 +120,7 @@ pub fn connect(
             &target,
             username.as_deref(),
             password.as_deref(),
+            &forward_args,
             ssh_passthrough,
             &remote,
         )?;
@@ -152,11 +166,16 @@ fn run_ssh(
     target: &str,
     username: Option<&str>,
     password: Option<&str>,
+    forward_args: &[String],
     ssh_passthrough: &[String],
     remote: &str,
 ) -> Result<ExitStatus> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-t");
+    // Forwards are rebuilt on every attempt, which is what re-establishes them
+    // after a drop. They go on before user passthrough, so an explicit
+    // `-- -L ...` still has the last word if ssh sees a conflicting bind.
+    cmd.args(forward_args);
     cmd.args(ssh_passthrough);
 
     let _askpass_cleanup = password
