@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod connect;
 mod model;
+mod mux;
 mod picker;
 mod registry;
 mod ssh_config;
@@ -62,6 +63,11 @@ async fn main() -> Result<()> {
             new_name,
             session,
         }) => cmd_rename(&host, session.as_deref(), &new_name, &config, &mut vault),
+        Some(Command::Cp {
+            source,
+            dest,
+            recursive,
+        }) => mux::copy(&source, &dest, recursive, &config, &mut vault),
         Some(Command::Vault { action }) => cmd_vault(action),
         None => match cli.host {
             Some(host) => connect::connect(

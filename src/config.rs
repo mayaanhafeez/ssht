@@ -32,6 +32,11 @@ pub struct Settings {
     pub reconnect_delay_secs: u64,
     /// Ceiling for the exponential backoff.
     pub reconnect_max_delay_secs: u64,
+    /// Open an ssh control master on connect so `ssht cp` can reuse the
+    /// connection instead of authenticating again.
+    pub multiplex: bool,
+    /// How long the control master lingers after the last client detaches.
+    pub control_persist_secs: u64,
 }
 
 impl Default for Settings {
@@ -42,6 +47,8 @@ impl Default for Settings {
             reconnect_max_attempts: 10,
             reconnect_delay_secs: 1,
             reconnect_max_delay_secs: 30,
+            multiplex: true,
+            control_persist_secs: 60,
         }
     }
 }
@@ -315,6 +322,10 @@ default_session = "main"
 # reconnect_max_attempts = 10
 # reconnect_delay_secs = 1
 # reconnect_max_delay_secs = 30
+# Keep an ssh control master open so `ssht cp` rides the existing connection
+# rather than authenticating a second time.
+# multiplex = true
+# control_persist_secs = 60
 
 # Per-host metadata. Keys are ssh aliases (as in ~/.ssh/config).
 # [hosts.prod-web]

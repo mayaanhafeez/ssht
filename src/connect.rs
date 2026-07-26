@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 
 use crate::config::{Config, Forwards};
+use crate::mux;
 use crate::state::State;
 use crate::tmux;
 use crate::vault::{self, LazyVault};
@@ -95,6 +96,7 @@ pub fn connect(
     let remote = tmux::build_remote_command(&session, layout);
     let policy = ReconnectPolicy::from_config(config, opts.no_reconnect);
     let forward_args = config.forward_args(alias, &opts.forwards)?;
+    let mux_args = mux::ssh_args(config)?;
 
     state
         .record_connection(alias)
@@ -120,6 +122,7 @@ pub fn connect(
             &target,
             username.as_deref(),
             password.as_deref(),
+            &mux_args,
             &forward_args,
             ssh_passthrough,
             &remote,
@@ -166,12 +169,17 @@ fn run_ssh(
     target: &str,
     username: Option<&str>,
     password: Option<&str>,
+    mux_args: &[String],
     forward_args: &[String],
     ssh_passthrough: &[String],
     remote: &str,
 ) -> Result<ExitStatus> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-t");
+    // Become the control master, so `ssht cp` to this host reuses the
+    // connection instead of opening (and authenticating) a second one. Re-set
+    // on each attempt so a reconnect re-establishes the master too.
+    cmd.args(mux_args);
     // Forwards are rebuilt on every attempt, which is what re-establishes them
     // after a drop. They go on before user passthrough, so an explicit
     // `-- -L ...` still has the last word if ssh sees a conflicting bind.
