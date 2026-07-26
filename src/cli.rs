@@ -33,6 +33,9 @@ pub struct Cli {
     /// Dynamic SOCKS forward, as `ssh -D`. Repeatable; adds to configured ones.
     #[arg(short = 'D', value_name = "SPEC")]
     pub dynamic_forward: Vec<String>,
+    /// Attach as a viewer: see the session but send no input to it.
+    #[arg(long)]
+    pub read_only: bool,
 
     /// Extra arguments passed directly to `ssh` (everything after `--`).
     #[arg(last = true, value_name = "SSH_ARGS")]

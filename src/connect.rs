@@ -64,6 +64,8 @@ pub struct ConnectOptions {
     pub no_reconnect: bool,
     /// Port forwards from the command line, merged with configured ones.
     pub forwards: Forwards,
+    /// Attach as a viewer: mirror the session but send it no input.
+    pub read_only: bool,
 }
 
 /// Connect to `alias`: ssh in and attach/create the tmux session.
@@ -93,7 +95,7 @@ pub fn connect(
         );
     }
 
-    let remote = tmux::build_remote_command(&session, layout);
+    let remote = tmux::build_remote_command(&session, layout, opts.read_only);
     let policy = ReconnectPolicy::from_config(config, opts.no_reconnect);
     let forward_args = config.forward_args(alias, &opts.forwards)?;
     let mux_args = mux::ssh_args(config)?;

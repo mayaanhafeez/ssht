@@ -41,6 +41,7 @@ async fn main() -> Result<()> {
             remote: cli.remote_forward.clone(),
             dynamic: cli.dynamic_forward.clone(),
         },
+        read_only: cli.read_only,
     };
 
     match cli.command {
