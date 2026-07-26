@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub layout: Option<String>,
 
+    /// Exit when the connection drops instead of reconnecting.
+    #[arg(long)]
+    pub no_reconnect: bool,
+
     /// Extra arguments passed directly to `ssh` (everything after `--`).
     #[arg(last = true, value_name = "SSH_ARGS")]
     pub ssh_args: Vec<String>,

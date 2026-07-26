@@ -22,12 +22,26 @@ pub struct Config {
 pub struct Settings {
     /// Default tmux session name when a host doesn't override it.
     pub default_session: String,
+    /// Re-run `ssh` when the transport drops mid-session. Safe by default:
+    /// tmux is holding the session remotely, so reattaching is a no-op if the
+    /// user meant to leave (a deliberate detach exits 0 and never retries).
+    pub reconnect: bool,
+    /// Give up after this many consecutive failed reconnects.
+    pub reconnect_max_attempts: u32,
+    /// Delay before the first reconnect; doubles each attempt after that.
+    pub reconnect_delay_secs: u64,
+    /// Ceiling for the exponential backoff.
+    pub reconnect_max_delay_secs: u64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             default_session: "main".to_string(),
+            reconnect: true,
+            reconnect_max_attempts: 10,
+            reconnect_delay_secs: 1,
+            reconnect_max_delay_secs: 30,
         }
     }
 }
@@ -125,6 +139,13 @@ const STARTER_CONFIG: &str = r#"# ssht configuration
 [settings]
 # Default tmux session name used when a host doesn't override it.
 default_session = "main"
+
+# Re-attach automatically when the connection drops (sleep, network switch,
+# VPN flap). A deliberate detach or exit is never retried.
+# reconnect = true
+# reconnect_max_attempts = 10
+# reconnect_delay_secs = 1
+# reconnect_max_delay_secs = 30
 
 # Per-host metadata. Keys are ssh aliases (as in ~/.ssh/config).
 # [hosts.prod-web]
