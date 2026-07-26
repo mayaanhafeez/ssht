@@ -37,6 +37,14 @@ pub struct Settings {
     pub multiplex: bool,
     /// How long the control master lingers after the last client detaches.
     pub control_persist_secs: u64,
+    /// Lines of tmux history to replay into the local terminal on attach, so
+    /// native scrollback works. 0 disables it.
+    ///
+    /// Off by default: the replay is a one-shot dump with no memory of what a
+    /// client has already seen, so reattaching repeatedly prints the same tail
+    /// again each time. Fixing that needs per-client sequence tracking, which
+    /// needs a daemon that outlives the connection.
+    pub scrollback_lines: u32,
 }
 
 impl Default for Settings {
@@ -49,6 +57,7 @@ impl Default for Settings {
             reconnect_max_delay_secs: 30,
             multiplex: true,
             control_persist_secs: 60,
+            scrollback_lines: 0,
         }
     }
 }
@@ -233,6 +242,24 @@ mod tests {
     }
 
     #[test]
+    fn starter_config_parses() {
+        // Four branches each appended a block to STARTER_CONFIG. It ships to
+        // users' disks on `ssht edit`, so a merge that broke it would surface
+        // as a parse error on their next run rather than in our tests.
+        toml::from_str::<Config>(STARTER_CONFIG).expect("starter config must parse");
+    }
+
+    #[test]
+    fn every_setting_has_a_default() {
+        // Settings is #[serde(default)]; an empty file must still load.
+        let config: Config = toml::from_str("").expect("empty config must load");
+        assert!(config.settings.reconnect);
+        assert!(config.settings.multiplex);
+        assert_eq!(config.settings.scrollback_lines, 0);
+        assert_eq!(config.settings.default_session, "main");
+    }
+
+    #[test]
     fn builds_flags_for_each_forward_kind() {
         let config = config_with_forwards();
         let args = config.forward_args("web", &Forwards::default()).unwrap();
@@ -326,6 +353,10 @@ default_session = "main"
 # rather than authenticating a second time.
 # multiplex = true
 # control_persist_secs = 60
+# Replay this many lines of tmux history into your terminal when attaching, so
+# your terminal's own scrollback works after reconnecting. 0 disables it.
+# Note that reattaching repeatedly re-prints the same tail each time.
+# scrollback_lines = 1000
 
 # Per-host metadata. Keys are ssh aliases (as in ~/.ssh/config).
 # [hosts.prod-web]

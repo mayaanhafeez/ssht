@@ -36,6 +36,9 @@ pub struct Cli {
     /// Attach as a viewer: see the session but send no input to it.
     #[arg(long)]
     pub read_only: bool,
+    /// Replay this many lines of history on attach, overriding the config.
+    #[arg(long, value_name = "N")]
+    pub scrollback: Option<u32>,
 
     /// Extra arguments passed directly to `ssh` (everything after `--`).
     #[arg(last = true, value_name = "SSH_ARGS")]

@@ -42,6 +42,7 @@ async fn main() -> Result<()> {
             dynamic: cli.dynamic_forward.clone(),
         },
         read_only: cli.read_only,
+        scrollback: cli.scrollback,
     };
 
     match cli.command {

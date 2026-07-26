@@ -66,6 +66,8 @@ pub struct ConnectOptions {
     pub forwards: Forwards,
     /// Attach as a viewer: mirror the session but send it no input.
     pub read_only: bool,
+    /// Lines of history to replay on attach, overriding the configured value.
+    pub scrollback: Option<u32>,
 }
 
 /// Connect to `alias`: ssh in and attach/create the tmux session.
@@ -95,10 +97,17 @@ pub fn connect(
         );
     }
 
-    let remote = tmux::build_remote_command(&session, layout, opts.read_only);
+    let scrollback_lines = opts.scrollback.unwrap_or(config.settings.scrollback_lines);
     let policy = ReconnectPolicy::from_config(config, opts.no_reconnect);
     let forward_args = config.forward_args(alias, &opts.forwards)?;
     let mux_args = mux::ssh_args(config)?;
+
+    // Replay history on the first attach only. On a reconnect the local
+    // terminal still holds everything printed before the drop, so replaying
+    // again would just duplicate it -- and with an aggressive retry loop that
+    // duplication compounds on every attempt.
+    let first_attach = tmux::build_remote_command(&session, layout, opts.read_only, scrollback_lines);
+    let reattach = tmux::build_remote_command(&session, layout, opts.read_only, 0);
 
     state
         .record_connection(alias)
@@ -118,6 +127,7 @@ pub fn connect(
     let password = settings.as_ref().and_then(|s| s.password.clone());
 
     let mut attempt: u32 = 0;
+    let mut remote = first_attach.as_str();
     loop {
         let started = Instant::now();
         let status = run_ssh(
@@ -127,7 +137,7 @@ pub fn connect(
             &mux_args,
             &forward_args,
             ssh_passthrough,
-            &remote,
+            remote,
         )?;
         let elapsed = started.elapsed();
 
@@ -153,6 +163,8 @@ pub fn connect(
                 policy.max_attempts
             );
         }
+
+        remote = reattach.as_str();
 
         let delay = policy.delay_for(attempt);
         eprintln!(
@@ -234,6 +246,17 @@ mod tests {
     fn backoff_does_not_overflow_on_absurd_attempt_counts() {
         let p = policy();
         assert_eq!(p.delay_for(u32::MAX), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn reattach_command_drops_the_scrollback_replay() {
+        // Integration invariant: the first attach replays history, a reconnect
+        // must not -- the local terminal still holds everything from before the
+        // drop, so replaying again would duplicate it once per retry.
+        let first = tmux::build_remote_command("main", None, false, 500);
+        let reattach = tmux::build_remote_command("main", None, false, 0);
+        assert!(first.contains("capture-pane"));
+        assert!(!reattach.contains("capture-pane"));
     }
 
     #[test]
