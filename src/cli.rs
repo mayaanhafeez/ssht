@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub layout: Option<String>,
 
+    /// Attach as a viewer: see the session but send no input to it.
+    #[arg(long)]
+    pub read_only: bool,
+
     /// Extra arguments passed directly to `ssh` (everything after `--`).
     #[arg(last = true, value_name = "SSH_ARGS")]
     pub ssh_args: Vec<String>,

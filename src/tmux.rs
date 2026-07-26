@@ -24,8 +24,23 @@ fn sh_quote(s: &str) -> String {
 
 /// Build the remote command run over ssh that attaches to (or creates) the tmux
 /// session, optionally applying a layout on first creation.
-pub fn build_remote_command(session: &str, layout: Option<&Layout>) -> String {
+///
+/// tmux already supports several clients on one session — that's what makes
+/// pairing work without any new machinery. `read_only` adds a viewer that can
+/// watch but not type, for showing work to someone else.
+pub fn build_remote_command(session: &str, layout: Option<&Layout>, read_only: bool) -> String {
     let s = sh_quote(session);
+
+    // A viewer joins an existing session. It never creates one and never
+    // applies a layout: both would be side effects nobody asked a read-only
+    // client to perform. `tmux attach` alone would print "no sessions", which
+    // doesn't say which session or host went missing.
+    if read_only {
+        return format!(
+            "if tmux has-session -t {s} 2>/dev/null; then tmux attach -r -t {s}; \
+             else echo \"ssht: no tmux session {session} to view on this host\" >&2; exit 1; fi"
+        );
+    }
 
     // No layout (or empty layout): the canonical attach-or-create one-liner.
     let layout = match layout {
@@ -132,15 +147,40 @@ mod tests {
 
     #[test]
     fn plain_session_uses_attach_or_create() {
-        let cmd = build_remote_command("main", None);
+        let cmd = build_remote_command("main", None, false);
         assert_eq!(cmd, "tmux new-session -A -s 'main'");
     }
 
     #[test]
     fn empty_layout_falls_back_to_plain() {
         let layout = Layout { windows: vec![] };
-        let cmd = build_remote_command("main", Some(&layout));
+        let cmd = build_remote_command("main", Some(&layout), false);
         assert_eq!(cmd, "tmux new-session -A -s 'main'");
+    }
+
+    #[test]
+    fn read_only_attaches_without_creating() {
+        let cmd = build_remote_command("main", None, true);
+        assert!(cmd.contains("tmux attach -r -t 'main'"));
+        // A viewer must never bring a session into existence.
+        assert!(!cmd.contains("new-session"));
+    }
+
+    #[test]
+    fn read_only_ignores_layout() {
+        let layout = Layout {
+            windows: vec![Window { name: "editor".into(), command: Some("nvim".into()) }],
+        };
+        let cmd = build_remote_command("dev", Some(&layout), true);
+        assert!(!cmd.contains("new-window"));
+        assert!(!cmd.contains("send-keys"));
+        assert!(cmd.contains("tmux attach -r -t 'dev'"));
+    }
+
+    #[test]
+    fn read_only_reports_which_session_is_missing() {
+        let cmd = build_remote_command("build", None, true);
+        assert!(cmd.contains("no tmux session build"));
     }
 
     #[test]
@@ -151,7 +191,7 @@ mod tests {
                 Window { name: "shell".into(), command: None },
             ],
         };
-        let cmd = build_remote_command("dev", Some(&layout));
+        let cmd = build_remote_command("dev", Some(&layout), false);
         assert!(cmd.starts_with("if tmux has-session -t 'dev'"));
         assert!(cmd.contains("tmux new-session -d -s 'dev' -n 'editor'"));
         assert!(cmd.contains("tmux send-keys -t 'dev:0' 'nvim' C-m"));

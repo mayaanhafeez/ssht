@@ -19,6 +19,7 @@ pub fn connect(
     layout_override: Option<&str>,
     ssh_passthrough: &[String],
     vault: &mut LazyVault,
+    read_only: bool,
 ) -> Result<()> {
     let session = config.session_for(alias);
     let layout = config.resolve_layout(alias, layout_override);
@@ -30,7 +31,7 @@ pub fn connect(
         );
     }
 
-    let remote = tmux::build_remote_command(&session, layout);
+    let remote = tmux::build_remote_command(&session, layout, read_only);
 
     state
         .record_connection(alias)
