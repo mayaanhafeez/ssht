@@ -42,6 +42,13 @@ pub struct HostMeta {
     pub layout: Option<String>,
     /// Free-form notes shown in the picker.
     pub notes: Option<String>,
+    /// Local forwards, `ssh -L` syntax minus the flag
+    /// (`[bind:]port:host:hostport`).
+    pub local_forwards: Vec<String>,
+    /// Remote forwards, `ssh -R` syntax minus the flag.
+    pub remote_forwards: Vec<String>,
+    /// Dynamic SOCKS forwards, `ssh -D` syntax minus the flag (`[bind:]port`).
+    pub dynamic_forwards: Vec<String>,
 }
 
 /// A tmux layout: an ordered set of windows.
@@ -103,6 +110,73 @@ impl Config {
             .or_else(|| self.hosts.get(alias).and_then(|m| m.layout.clone()))?;
         self.layouts.get(&name)
     }
+
+    /// Build the `ssh` arguments for a host's configured port forwards, plus
+    /// any given on the command line. Because every reconnect re-invokes `ssh`
+    /// with these same arguments, forwards come back with the session.
+    pub fn forward_args(&self, alias: &str, extra: &Forwards) -> Result<Vec<String>> {
+        let meta = self.hosts.get(alias);
+        let mut args = Vec::new();
+
+        let groups: [(&str, &[String], &[String]); 3] = [
+            (
+                "-L",
+                meta.map(|m| m.local_forwards.as_slice()).unwrap_or(&[]),
+                &extra.local,
+            ),
+            (
+                "-R",
+                meta.map(|m| m.remote_forwards.as_slice()).unwrap_or(&[]),
+                &extra.remote,
+            ),
+            (
+                "-D",
+                meta.map(|m| m.dynamic_forwards.as_slice()).unwrap_or(&[]),
+                &extra.dynamic,
+            ),
+        ];
+
+        for (flag, configured, from_cli) in groups {
+            for spec in configured.iter().chain(from_cli.iter()) {
+                validate_forward(flag, spec)?;
+                args.push(flag.to_string());
+                args.push(spec.clone());
+            }
+        }
+
+        Ok(args)
+    }
+}
+
+/// Port forwards supplied on the command line, merged with configured ones.
+#[derive(Debug, Default, Clone)]
+pub struct Forwards {
+    pub local: Vec<String>,
+    pub remote: Vec<String>,
+    pub dynamic: Vec<String>,
+}
+
+impl Forwards {
+    pub fn is_empty(&self) -> bool {
+        self.local.is_empty() && self.remote.is_empty() && self.dynamic.is_empty()
+    }
+}
+
+/// Reject specs that `ssh` would misread. We deliberately don't parse the full
+/// grammar — IPv6 brackets, unix-socket paths and `*` binds are all legal and
+/// varied — but a spec containing whitespace would be split into separate argv
+/// entries and silently mean something else, so that one is worth catching.
+fn validate_forward(flag: &str, spec: &str) -> Result<()> {
+    if spec.trim().is_empty() {
+        anyhow::bail!("empty {flag} port forward in config");
+    }
+    if spec.split_whitespace().count() > 1 {
+        anyhow::bail!(
+            "{flag} port forward {spec:?} contains whitespace; write it as a \
+             single spec such as \"8080:localhost:80\""
+        );
+    }
+    Ok(())
 }
 
 /// Write a starter config file if one doesn't exist; return its path.
@@ -119,6 +193,101 @@ pub fn ensure_config_file() -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_with_forwards() -> Config {
+        let mut config = Config::default();
+        config.hosts.insert(
+            "web".to_string(),
+            HostMeta {
+                local_forwards: vec!["8080:localhost:80".into()],
+                remote_forwards: vec!["9000:localhost:9000".into()],
+                dynamic_forwards: vec!["1080".into()],
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn builds_flags_for_each_forward_kind() {
+        let config = config_with_forwards();
+        let args = config.forward_args("web", &Forwards::default()).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-L", "8080:localhost:80",
+                "-R", "9000:localhost:9000",
+                "-D", "1080",
+            ]
+        );
+    }
+
+    #[test]
+    fn host_without_forwards_gets_none() {
+        let config = config_with_forwards();
+        assert!(config.forward_args("other", &Forwards::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cli_forwards_append_to_configured_ones() {
+        let config = config_with_forwards();
+        let extra = Forwards {
+            local: vec!["5432:db:5432".into()],
+            ..Default::default()
+        };
+        let args = config.forward_args("web", &extra).unwrap();
+        // Configured first, then the command-line addition, within -L.
+        assert_eq!(&args[0..4], &["-L", "8080:localhost:80", "-L", "5432:db:5432"]);
+    }
+
+    #[test]
+    fn cli_forwards_work_for_hosts_with_no_config_entry() {
+        let config = Config::default();
+        let extra = Forwards {
+            dynamic: vec!["1080".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            config.forward_args("anything", &extra).unwrap(),
+            vec!["-D", "1080"]
+        );
+    }
+
+    #[test]
+    fn whitespace_in_a_spec_is_rejected() {
+        let mut config = Config::default();
+        config.hosts.insert(
+            "web".to_string(),
+            HostMeta {
+                // A plausible mistake: writing the flag into the value.
+                local_forwards: vec!["-L 8080:localhost:80".into()],
+                ..Default::default()
+            },
+        );
+        let err = config
+            .forward_args("web", &Forwards::default())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("whitespace"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn empty_spec_is_rejected() {
+        let mut config = Config::default();
+        config.hosts.insert(
+            "web".to_string(),
+            HostMeta {
+                remote_forwards: vec!["  ".into()],
+                ..Default::default()
+            },
+        );
+        assert!(config.forward_args("web", &Forwards::default()).is_err());
+    }
+}
+
 const STARTER_CONFIG: &str = r#"# ssht configuration
 # Docs: https://github.com/ (your repo)
 
@@ -131,6 +300,12 @@ default_session = "main"
 # session = "web"
 # layout = "dev"
 # notes = "primary web server"
+#
+# Port forwards re-established on every connect and every reconnect.
+# Same syntax as ssh's -L / -R / -D, minus the flag itself.
+# local_forwards = ["8080:localhost:80"]
+# remote_forwards = ["9000:localhost:9000"]
+# dynamic_forwards = ["1080"]
 
 # Named layouts applied on first attach.
 # [[layouts.dev.windows]]

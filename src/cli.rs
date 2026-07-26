@@ -18,6 +18,18 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub layout: Option<String>,
 
+    /// Local port forward, as `ssh -L`. Repeatable; adds to configured ones.
+    #[arg(short = 'L', value_name = "SPEC")]
+    pub local_forward: Vec<String>,
+
+    /// Remote port forward, as `ssh -R`. Repeatable; adds to configured ones.
+    #[arg(short = 'R', value_name = "SPEC")]
+    pub remote_forward: Vec<String>,
+
+    /// Dynamic SOCKS forward, as `ssh -D`. Repeatable; adds to configured ones.
+    #[arg(short = 'D', value_name = "SPEC")]
+    pub dynamic_forward: Vec<String>,
+
     /// Extra arguments passed directly to `ssh` (everything after `--`).
     #[arg(last = true, value_name = "SSH_ARGS")]
     pub ssh_args: Vec<String>,
