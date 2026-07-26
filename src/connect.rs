@@ -5,6 +5,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::config::Config;
+use crate::mux;
 use crate::state::State;
 use crate::tmux;
 use crate::vault::{self, LazyVault};
@@ -43,6 +44,9 @@ pub fn connect(
 
     let mut cmd = Command::new("ssh");
     cmd.arg("-t");
+    // Become the control master, so `ssht cp` to this host reuses the
+    // connection instead of opening (and authenticating) a second one.
+    cmd.args(mux::ssh_args(config)?);
     cmd.args(ssh_passthrough);
 
     let _askpass_cleanup = settings.as_ref()

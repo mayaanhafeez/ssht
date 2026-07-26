@@ -22,12 +22,19 @@ pub struct Config {
 pub struct Settings {
     /// Default tmux session name when a host doesn't override it.
     pub default_session: String,
+    /// Open an ssh control master on connect so `ssht cp` can reuse the
+    /// connection instead of authenticating again.
+    pub multiplex: bool,
+    /// How long the control master lingers after the last client detaches.
+    pub control_persist_secs: u64,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             default_session: "main".to_string(),
+            multiplex: true,
+            control_persist_secs: 60,
         }
     }
 }
@@ -125,6 +132,11 @@ const STARTER_CONFIG: &str = r#"# ssht configuration
 [settings]
 # Default tmux session name used when a host doesn't override it.
 default_session = "main"
+
+# Keep an ssh control master open so `ssht cp` rides the existing connection
+# rather than authenticating a second time.
+# multiplex = true
+# control_persist_secs = 60
 
 # Per-host metadata. Keys are ssh aliases (as in ~/.ssh/config).
 # [hosts.prod-web]

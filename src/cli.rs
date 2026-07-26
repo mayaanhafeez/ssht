@@ -34,6 +34,18 @@ pub enum Command {
     Last,
     /// Open the ssht config file in $EDITOR.
     Edit,
+    /// Copy files to or from a host over the existing connection.
+    ///
+    /// Exactly one of SOURCE and DEST names a host, as `host:path`.
+    Cp {
+        /// Source path, local or `host:path`.
+        source: String,
+        /// Destination path, local or `host:path`.
+        dest: String,
+        /// Copy directories recursively.
+        #[arg(short, long)]
+        recursive: bool,
+    },
     /// Manage the encrypted settings vault (address, name, username, password).
     Vault {
         #[command(subcommand)]
