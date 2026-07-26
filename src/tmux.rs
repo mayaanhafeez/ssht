@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::config::Layout;
 
 /// Quote a string for safe inclusion in a POSIX shell command.
-fn sh_quote(s: &str) -> String {
+pub fn sh_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {

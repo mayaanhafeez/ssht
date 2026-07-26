@@ -6,6 +6,7 @@ mod config;
 mod connect;
 mod model;
 mod picker;
+mod registry;
 mod ssh_config;
 mod state;
 mod tmux;
@@ -37,6 +38,15 @@ async fn main() -> Result<()> {
             cmd_last(&config, &state, cli.layout.as_deref(), &cli.ssh_args, &mut vault)
         }
         Some(Command::Edit) => cmd_edit(),
+        Some(Command::Sessions { host }) => cmd_sessions(&host, &mut vault),
+        Some(Command::Kill { host, session }) => {
+            cmd_kill(&host, session.as_deref(), &config, &mut vault)
+        }
+        Some(Command::Rename {
+            host,
+            new_name,
+            session,
+        }) => cmd_rename(&host, session.as_deref(), &new_name, &config, &mut vault),
         Some(Command::Vault { action }) => cmd_vault(action),
         None => match cli.host {
             Some(host) => connect::connect(
@@ -171,6 +181,53 @@ fn cmd_last(
             anyhow::bail!("no previous connection recorded yet");
         }
     }
+}
+
+fn cmd_sessions(host: &str, vault: &mut LazyVault) -> Result<()> {
+    let sessions = registry::list(host, vault)?;
+    if sessions.is_empty() {
+        eprintln!("No tmux sessions running on {host}");
+        return Ok(());
+    }
+    println!("{:<24} {:>7}  {}", "SESSION", "WINDOWS", "ATTACHED");
+    for s in &sessions {
+        println!(
+            "{:<24} {:>7}  {}",
+            s.name,
+            s.windows,
+            if s.attached { "yes" } else { "no" }
+        );
+    }
+    Ok(())
+}
+
+fn cmd_kill(
+    host: &str,
+    session: Option<&str>,
+    config: &Config,
+    vault: &mut LazyVault,
+) -> Result<()> {
+    let session = session
+        .map(str::to_string)
+        .unwrap_or_else(|| config.session_for(host));
+    registry::kill(host, &session, vault)?;
+    eprintln!("Killed session {session:?} on {host}");
+    Ok(())
+}
+
+fn cmd_rename(
+    host: &str,
+    session: Option<&str>,
+    new_name: &str,
+    config: &Config,
+    vault: &mut LazyVault,
+) -> Result<()> {
+    let session = session
+        .map(str::to_string)
+        .unwrap_or_else(|| config.session_for(host));
+    registry::rename(host, &session, new_name, vault)?;
+    eprintln!("Renamed session {session:?} to {new_name:?} on {host}");
+    Ok(())
 }
 
 fn cmd_edit() -> Result<()> {

@@ -34,6 +34,28 @@ pub enum Command {
     Last,
     /// Open the ssht config file in $EDITOR.
     Edit,
+    /// List the tmux sessions running on a host.
+    Sessions {
+        /// Host alias to query.
+        host: String,
+    },
+    /// Kill a tmux session on a host.
+    Kill {
+        /// Host alias.
+        host: String,
+        /// Session to kill. Defaults to the host's configured session.
+        session: Option<String>,
+    },
+    /// Rename a tmux session on a host.
+    Rename {
+        /// Host alias.
+        host: String,
+        /// New session name.
+        new_name: String,
+        /// Session to rename. Defaults to the host's configured session.
+        #[arg(long, value_name = "NAME")]
+        session: Option<String>,
+    },
     /// Manage the encrypted settings vault (address, name, username, password).
     Vault {
         #[command(subcommand)]
