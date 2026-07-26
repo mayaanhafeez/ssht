@@ -100,7 +100,7 @@ pub fn connect(
     let scrollback_lines = opts.scrollback.unwrap_or(config.settings.scrollback_lines);
     let policy = ReconnectPolicy::from_config(config, opts.no_reconnect);
     let forward_args = config.forward_args(alias, &opts.forwards)?;
-    let mux_args = mux::ssh_args(config)?;
+    let mux_args = mux::ssh_args(config);
 
     // Replay history on the first attach only. On a reconnect the local
     // terminal still holds everything printed before the drop, so replaying
