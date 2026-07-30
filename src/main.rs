@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod connect;
 mod model;
+mod mux;
 mod picker;
 mod ssh_config;
 mod state;
@@ -48,6 +49,11 @@ async fn main() -> Result<()> {
             &forwards,
         ),
         Some(Command::Edit) => cmd_edit(),
+        Some(Command::Cp {
+            source,
+            dest,
+            recursive,
+        }) => mux::copy(&source, &dest, recursive, &config, &mut vault),
         Some(Command::Vault { action }) => cmd_vault(action),
         None => match cli.host {
             Some(host) => connect::connect(
