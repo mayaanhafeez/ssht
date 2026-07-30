@@ -4,7 +4,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
+use crate::config::{Config, Forwards};
 use crate::state::State;
 use crate::tmux;
 use crate::vault::{self, LazyVault};
@@ -19,6 +19,7 @@ pub fn connect(
     layout_override: Option<&str>,
     ssh_passthrough: &[String],
     vault: &mut LazyVault,
+    forwards: &Forwards,
 ) -> Result<()> {
     let session = config.session_for(alias);
     let layout = config.resolve_layout(alias, layout_override);
@@ -31,6 +32,7 @@ pub fn connect(
     }
 
     let remote = tmux::build_remote_command(&session, layout);
+    let forward_args = config.forward_args(alias, forwards)?;
 
     state
         .record_connection(alias)
@@ -43,6 +45,9 @@ pub fn connect(
 
     let mut cmd = Command::new("ssh");
     cmd.arg("-t");
+    // Forwards go on before user passthrough, so an explicit `-- -L ...` still
+    // has the last word if ssh sees a conflicting bind.
+    cmd.args(&forward_args);
     cmd.args(ssh_passthrough);
 
     let _askpass_cleanup = settings.as_ref()
