@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
             &cli.ssh_args,
             &mut vault,
             &forwards,
+            cli.scrollback,
         ),
         Some(Command::Edit) => cmd_edit(),
         Some(Command::Cp {
@@ -64,6 +65,7 @@ async fn main() -> Result<()> {
                 &cli.ssh_args,
                 &mut vault,
                 &forwards,
+                cli.scrollback,
             ),
             None => cmd_picker(
                 &config,
@@ -72,6 +74,7 @@ async fn main() -> Result<()> {
                 &cli.ssh_args,
                 &mut vault,
                 &forwards,
+                cli.scrollback,
             )
             .await,
         },
@@ -188,11 +191,12 @@ fn cmd_last(
     ssh_args: &[String],
     vault: &mut LazyVault,
     forwards: &Forwards,
+    scrollback: Option<u32>,
 ) -> Result<()> {
     match state.last_host()? {
         Some(alias) => {
             eprintln!("Reconnecting to {alias}…");
-            connect::connect(&alias, config, state, layout, ssh_args, vault, forwards)
+            connect::connect(&alias, config, state, layout, ssh_args, vault, forwards, scrollback)
         }
         None => {
             anyhow::bail!("no previous connection recorded yet");
@@ -222,6 +226,7 @@ async fn cmd_picker(
     ssh_args: &[String],
     vault: &mut LazyVault,
     forwards: &Forwards,
+    scrollback: Option<u32>,
 ) -> Result<()> {
     let hosts = load_hosts(config, state)?;
     if hosts.is_empty() {
@@ -240,7 +245,7 @@ async fn cmd_picker(
 
     match selection {
         Some(alias) => {
-            connect::connect(&alias, config, state, layout, ssh_args, vault, forwards)
+            connect::connect(&alias, config, state, layout, ssh_args, vault, forwards, scrollback)
         }
         None => Ok(()),
     }

@@ -27,6 +27,14 @@ pub struct Settings {
     pub multiplex: bool,
     /// How long the control master lingers after the last client detaches.
     pub control_persist_secs: u64,
+    /// Lines of tmux history to replay into the local terminal on attach, so
+    /// native scrollback works. 0 disables it.
+    ///
+    /// Off by default: the replay is a one-shot dump with no memory of what a
+    /// client has already seen, so reattaching repeatedly prints the same tail
+    /// again each time. Fixing that needs per-client sequence tracking, which
+    /// needs a daemon that outlives the connection.
+    pub scrollback_lines: u32,
 }
 
 impl Default for Settings {
@@ -35,6 +43,7 @@ impl Default for Settings {
             default_session: "main".to_string(),
             multiplex: true,
             control_persist_secs: 60,
+            scrollback_lines: 0,
         }
     }
 }
@@ -306,6 +315,11 @@ default_session = "main"
 # rather than authenticating a second time.
 # multiplex = true
 # control_persist_secs = 60
+
+# Replay this many lines of tmux history into your terminal when attaching, so
+# your terminal's own scrollback works after reconnecting. 0 disables it.
+# Note that reattaching repeatedly re-prints the same tail each time.
+# scrollback_lines = 1000
 
 # Per-host metadata. Keys are ssh aliases (as in ~/.ssh/config).
 # [hosts.prod-web]
