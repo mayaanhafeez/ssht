@@ -25,3 +25,6 @@ Thumbs.db
 # Claude / agent files
 .claude/
 CLAUDE.local.md
+
+# Local planning notes
+.plans/
