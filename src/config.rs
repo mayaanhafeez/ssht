@@ -22,6 +22,16 @@ pub struct Config {
 pub struct Settings {
     /// Default tmux session name when a host doesn't override it.
     pub default_session: String,
+    /// Re-run `ssh` when the transport drops mid-session. Safe by default:
+    /// tmux is holding the session remotely, so reattaching is a no-op if the
+    /// user meant to leave (a deliberate detach exits 0 and never retries).
+    pub reconnect: bool,
+    /// Give up after this many consecutive failed reconnects.
+    pub reconnect_max_attempts: u32,
+    /// Delay before the first reconnect; doubles each attempt after that.
+    pub reconnect_delay_secs: u64,
+    /// Ceiling for the exponential backoff.
+    pub reconnect_max_delay_secs: u64,
     /// Open an ssh control master on connect so `ssht cp` can reuse the
     /// connection instead of authenticating again.
     pub multiplex: bool,
@@ -41,6 +51,10 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             default_session: "main".to_string(),
+            reconnect: true,
+            reconnect_max_attempts: 10,
+            reconnect_delay_secs: 1,
+            reconnect_max_delay_secs: 30,
             multiplex: true,
             control_persist_secs: 60,
             scrollback_lines: 0,
@@ -228,6 +242,24 @@ mod tests {
     }
 
     #[test]
+    fn starter_config_parses() {
+        // Four branches each appended a block to STARTER_CONFIG. It ships to
+        // users' disks on `ssht edit`, so a merge that broke it would surface
+        // as a parse error on their next run rather than in our tests.
+        toml::from_str::<Config>(STARTER_CONFIG).expect("starter config must parse");
+    }
+
+    #[test]
+    fn every_setting_has_a_default() {
+        // Settings is #[serde(default)]; an empty file must still load.
+        let config: Config = toml::from_str("").expect("empty config must load");
+        assert!(config.settings.reconnect);
+        assert!(config.settings.multiplex);
+        assert_eq!(config.settings.scrollback_lines, 0);
+        assert_eq!(config.settings.default_session, "main");
+    }
+
+    #[test]
     fn builds_flags_for_each_forward_kind() {
         let config = config_with_forwards();
         let args = config.forward_args("web", &Forwards::default()).unwrap();
@@ -311,11 +343,16 @@ const STARTER_CONFIG: &str = r#"# ssht configuration
 # Default tmux session name used when a host doesn't override it.
 default_session = "main"
 
+# Re-attach automatically when the connection drops (sleep, network switch,
+# VPN flap). A deliberate detach or exit is never retried.
+# reconnect = true
+# reconnect_max_attempts = 10
+# reconnect_delay_secs = 1
+# reconnect_max_delay_secs = 30
 # Keep an ssh control master open so `ssht cp` rides the existing connection
 # rather than authenticating a second time.
 # multiplex = true
 # control_persist_secs = 60
-
 # Replay this many lines of tmux history into your terminal when attaching, so
 # your terminal's own scrollback works after reconnecting. 0 disables it.
 # Note that reattaching repeatedly re-prints the same tail each time.

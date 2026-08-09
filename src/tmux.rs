@@ -8,7 +8,7 @@ use tokio::sync::{mpsc, Semaphore};
 use crate::config::Layout;
 
 /// Quote a string for safe inclusion in a POSIX shell command.
-fn sh_quote(s: &str) -> String {
+pub fn sh_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');
     for ch in s.chars() {
@@ -55,13 +55,32 @@ fn scrollback_replay(session: &str, lines: u32) -> String {
 /// Build the remote command run over ssh that attaches to (or creates) the tmux
 /// session, optionally applying a layout on first creation and replaying up to
 /// `scrollback_lines` of history first.
+///
+/// tmux already supports several clients on one session — that's what makes
+/// pairing work without any new machinery. `read_only` adds a viewer that can
+/// watch but not type, for showing work to someone else.
 pub fn build_remote_command(
     session: &str,
     layout: Option<&Layout>,
+    read_only: bool,
     scrollback_lines: u32,
 ) -> String {
     let s = sh_quote(session);
     let replay = scrollback_replay(session, scrollback_lines);
+
+    // A viewer joins an existing session. It never creates one and never
+    // applies a layout: both would be side effects nobody asked a read-only
+    // client to perform. `tmux attach` alone would print "no sessions", which
+    // doesn't say which session or host went missing.
+    // A viewer still gets the history replay: it is their own terminal being
+    // filled in, and arriving mid-session without context is the whole problem
+    // scrollback solves.
+    if read_only {
+        return format!(
+            "{replay}if tmux has-session -t {s} 2>/dev/null; then tmux attach -r -t {s}; \
+             else echo \"ssht: no tmux session {session} to view on this host\" >&2; exit 1; fi"
+        );
+    }
 
     // No layout (or empty layout): the canonical attach-or-create one-liner.
     let layout = match layout {
@@ -168,26 +187,51 @@ mod tests {
 
     #[test]
     fn plain_session_uses_attach_or_create() {
-        let cmd = build_remote_command("main", None, 0);
+        let cmd = build_remote_command("main", None, false, 0);
         assert_eq!(cmd, "tmux new-session -A -s 'main'");
     }
 
     #[test]
     fn empty_layout_falls_back_to_plain() {
         let layout = Layout { windows: vec![] };
-        let cmd = build_remote_command("main", Some(&layout), 0);
+        let cmd = build_remote_command("main", Some(&layout), false, 0);
         assert_eq!(cmd, "tmux new-session -A -s 'main'");
+    }
+
+    #[test]
+    fn read_only_attaches_without_creating() {
+        let cmd = build_remote_command("main", None, true, 0);
+        assert!(cmd.contains("tmux attach -r -t 'main'"));
+        // A viewer must never bring a session into existence.
+        assert!(!cmd.contains("new-session"));
+    }
+
+    #[test]
+    fn read_only_ignores_layout() {
+        let layout = Layout {
+            windows: vec![Window { name: "editor".into(), command: Some("nvim".into()) }],
+        };
+        let cmd = build_remote_command("dev", Some(&layout), true, 0);
+        assert!(!cmd.contains("new-window"));
+        assert!(!cmd.contains("send-keys"));
+        assert!(cmd.contains("tmux attach -r -t 'dev'"));
+    }
+
+    #[test]
+    fn read_only_reports_which_session_is_missing() {
+        let cmd = build_remote_command("build", None, true, 0);
+        assert!(cmd.contains("no tmux session build"));
     }
 
     #[test]
     fn zero_lines_replays_nothing() {
         assert_eq!(scrollback_replay("main", 0), "");
-        assert!(!build_remote_command("main", None, 0).contains("capture-pane"));
+        assert!(!build_remote_command("main", None, false, 0).contains("capture-pane"));
     }
 
     #[test]
     fn replay_captures_history_above_the_visible_screen() {
-        let cmd = build_remote_command("main", None, 500);
+        let cmd = build_remote_command("main", None, false, 500);
         // -E -1 stops above the screen that attaching will redraw anyway.
         assert!(cmd.contains("tmux capture-pane -p -e -S -500 -E -1 -t 'main'"));
         // and the replay has to happen before the attach, not after
@@ -198,7 +242,7 @@ mod tests {
 
     #[test]
     fn replay_skips_the_alternate_screen() {
-        let cmd = build_remote_command("main", None, 500);
+        let cmd = build_remote_command("main", None, false, 500);
         assert!(cmd.contains("'#{alternate_on}'"));
     }
 
@@ -207,7 +251,7 @@ mod tests {
         let layout = Layout {
             windows: vec![Window { name: "editor".into(), command: None }],
         };
-        let cmd = build_remote_command("dev", Some(&layout), 200);
+        let cmd = build_remote_command("dev", Some(&layout), false, 200);
         assert!(cmd.starts_with("if tmux has-session -t 'dev' 2>/dev/null && "));
         assert!(cmd.contains("capture-pane"));
         assert!(cmd.contains("new-session -d -s 'dev'"));
@@ -221,7 +265,7 @@ mod tests {
                 Window { name: "shell".into(), command: None },
             ],
         };
-        let cmd = build_remote_command("dev", Some(&layout), 0);
+        let cmd = build_remote_command("dev", Some(&layout), false, 0);
         assert!(cmd.starts_with("if tmux has-session -t 'dev'"));
         assert!(cmd.contains("tmux new-session -d -s 'dev' -n 'editor'"));
         assert!(cmd.contains("tmux send-keys -t 'dev:0' 'nvim' C-m"));

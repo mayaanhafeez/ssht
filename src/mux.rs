@@ -6,7 +6,7 @@
 //! building a new one: no second authentication, no second TCP handshake, no
 //! re-prompting for a vault password.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
@@ -14,53 +14,116 @@ use anyhow::{Context, Result};
 use crate::config::Config;
 use crate::vault::{self, LazyVault};
 
-/// Directory holding control sockets (`~/.local/share/ssht/control`, honoring
-/// `$XDG_DATA_HOME`), matching where the state database lives.
-fn control_dir() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_DATA_HOME") {
-        Some(v) if !v.is_empty() => PathBuf::from(v),
-        _ => dirs::home_dir()
-            .context("could not determine home directory")?
-            .join(".local")
-            .join("share"),
+/// Longest path that can be bound as a unix domain socket. macOS allows 104
+/// bytes including the terminating NUL, Linux 108; take the smaller.
+const MAX_SOCKET_PATH: usize = 103;
+
+/// `%C` expands to a SHA-1 hex digest of (host, port, user, proxy): 40
+/// characters.
+const CONTROL_HASH_LEN: usize = 40;
+
+/// While a master is starting, ssh binds the socket under a temporary name —
+/// the ControlPath plus a dot and 16 random characters — and renames it into
+/// place once the connection is up. The *temporary* name is what has to fit,
+/// so budget for it.
+const SSH_TEMP_SUFFIX_LEN: usize = 17;
+
+/// Filename prefix inside the control directory.
+const CONTROL_PREFIX: &str = "cm-";
+
+/// Whether sockets under `dir` will fit in a unix socket address once ssh has
+/// expanded `%C` and added its temporary suffix.
+fn dir_fits(dir: &Path) -> bool {
+    // dir + "/" + "cm-" + hash + ".<16 random>"
+    dir.as_os_str().len() + 1 + CONTROL_PREFIX.len() + CONTROL_HASH_LEN + SSH_TEMP_SUFFIX_LEN
+        <= MAX_SOCKET_PATH
+}
+
+/// Candidate directories for control sockets, best first.
+///
+/// The XDG data directory is preferred because it's where the rest of ssht's
+/// state lives — but on macOS `~/.local/share/ssht/control` is already 44
+/// characters, and with the expansions above that lands two bytes over the
+/// limit. So there are shorter fallbacks, all still inside the user's own
+/// tree (never `/tmp`, where another user could pre-create the directory and
+/// deny us the socket).
+fn candidate_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    let data_base = match std::env::var_os("XDG_DATA_HOME") {
+        Some(v) if !v.is_empty() => Some(PathBuf::from(v)),
+        _ => dirs::home_dir().map(|h| h.join(".local").join("share")),
     };
-    Ok(base.join("ssht").join("control"))
-}
-
-/// Create the control directory if needed and return the `ControlPath`
-/// template. `%C` is ssh's hash of (host, port, user, proxy) — a fixed 32
-/// characters, which matters because the whole path has to fit in a unix
-/// socket address (104 bytes on macOS).
-pub fn control_path() -> Result<PathBuf> {
-    let dir = control_dir()?;
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-
-    // Control sockets grant access to an authenticated connection, so the
-    // directory must not be readable by other users on the box.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("securing {}", dir.display()))?;
+    if let Some(base) = data_base {
+        dirs.push(base.join("ssht").join("control"));
     }
 
-    Ok(dir.join("cm-%C"))
+    // Linux: /run/user/<uid>/ssht — short, tmpfs, cleaned on logout.
+    if let Some(v) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
+        dirs.push(PathBuf::from(v).join("ssht"));
+    }
+
+    // Last resort: a short dedicated directory in the home directory.
+    if let Some(home) = dirs::home_dir() {
+        dirs.push(home.join(".ssht"));
+    }
+
+    dirs
 }
 
-/// The `-o` arguments that turn on multiplexing, or nothing if it's disabled.
-pub fn ssh_args(config: &Config) -> Result<Vec<String>> {
+/// Create the control directory and return the `ControlPath` template, or
+/// `None` if no candidate directory yields a short enough path.
+///
+/// Returning `None` rather than erroring is deliberate: multiplexing is an
+/// optimisation, and failing to set it up must never be the reason a
+/// connection doesn't happen.
+pub fn control_path() -> Option<PathBuf> {
+    for dir in candidate_dirs() {
+        if !dir_fits(&dir) {
+            continue;
+        }
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+
+        // Control sockets grant access to an authenticated connection, so the
+        // directory must not be reachable by other users on the box.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).is_err() {
+                continue;
+            }
+        }
+
+        return Some(dir.join(format!("{CONTROL_PREFIX}%C")));
+    }
+    None
+}
+
+/// The `-o` arguments that turn on multiplexing, or nothing if it's disabled
+/// or unavailable.
+pub fn ssh_args(config: &Config) -> Vec<String> {
     if !config.settings.multiplex {
-        return Ok(Vec::new());
+        return Vec::new();
     }
-    let path = control_path()?;
-    Ok(vec![
+    let Some(path) = control_path() else {
+        // Don't fail the connection over an optimisation; say so once and
+        // carry on without it.
+        eprintln!(
+            "ssht: no control socket path short enough for this system; \
+             continuing without connection multiplexing"
+        );
+        return Vec::new();
+    };
+    vec![
         "-o".into(),
         "ControlMaster=auto".into(),
         "-o".into(),
         format!("ControlPath={}", path.display()),
         "-o".into(),
         format!("ControlPersist={}s", config.settings.control_persist_secs),
-    ])
+    ]
 }
 
 /// One side of a transfer: a local path, or a path on a remote host.
@@ -121,7 +184,7 @@ pub fn copy(
         .map(|password| vault::setup_ssh_askpass(&mut cmd, password))
         .transpose()?;
 
-    cmd.args(ssh_args(config)?);
+    cmd.args(ssh_args(config));
     if recursive {
         cmd.arg("-r");
     }
@@ -231,6 +294,48 @@ mod tests {
     fn multiplex_can_be_turned_off() {
         let mut config = Config::default();
         config.settings.multiplex = false;
-        assert!(ssh_args(&config).unwrap().is_empty());
+        assert!(ssh_args(&config).is_empty());
+    }
+
+    #[test]
+    fn rejects_the_directory_that_actually_broke() {
+        // The real failure, verbatim from the bug report. The directory is 44
+        // characters; once ssh expands %C to a 40-char hash and adds its
+        // 17-char temporary suffix the socket path is 105 bytes, past the
+        // macOS limit of 103.
+        let dir = Path::new("/Users/ayaanhafeez/.local/share/ssht/control");
+        assert_eq!(dir.as_os_str().len(), 44);
+        assert_eq!(
+            dir.as_os_str().len() + 1 + CONTROL_PREFIX.len() + CONTROL_HASH_LEN
+                + SSH_TEMP_SUFFIX_LEN,
+            105
+        );
+        assert!(!dir_fits(dir));
+    }
+
+    #[test]
+    fn accepts_a_short_enough_directory() {
+        assert!(dir_fits(Path::new("/Users/ayaanhafeez/.ssht")));
+        assert!(dir_fits(Path::new("/run/user/1000/ssht")));
+        assert!(dir_fits(Path::new("/home/bob/.local/share/ssht/control")));
+    }
+
+    #[test]
+    fn boundary_is_exactly_the_socket_limit() {
+        // Longest directory that still fits, and one character more.
+        let max_dir_len = MAX_SOCKET_PATH - 1 - CONTROL_PREFIX.len() - CONTROL_HASH_LEN - SSH_TEMP_SUFFIX_LEN;
+        let ok = PathBuf::from("/".repeat(1) + &"a".repeat(max_dir_len - 1));
+        assert_eq!(ok.as_os_str().len(), max_dir_len);
+        assert!(dir_fits(&ok));
+
+        let too_long = PathBuf::from("/".repeat(1) + &"a".repeat(max_dir_len));
+        assert!(!dir_fits(&too_long));
+    }
+
+    #[test]
+    fn always_offers_a_short_candidate() {
+        // Whatever the platform, at least one candidate must be usable --
+        // otherwise multiplexing silently never works.
+        assert!(candidate_dirs().iter().any(|d| dir_fits(d)));
     }
 }

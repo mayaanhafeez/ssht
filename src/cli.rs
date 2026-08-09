@@ -18,6 +18,10 @@ pub struct Cli {
     #[arg(long, value_name = "NAME")]
     pub layout: Option<String>,
 
+    /// Exit when the connection drops instead of reconnecting.
+    #[arg(long)]
+    pub no_reconnect: bool,
+
     /// Local port forward, as `ssh -L`. Repeatable; adds to configured ones.
     #[arg(short = 'L', value_name = "SPEC")]
     pub local_forward: Vec<String>,
@@ -29,7 +33,9 @@ pub struct Cli {
     /// Dynamic SOCKS forward, as `ssh -D`. Repeatable; adds to configured ones.
     #[arg(short = 'D', value_name = "SPEC")]
     pub dynamic_forward: Vec<String>,
-
+    /// Attach as a viewer: see the session but send no input to it.
+    #[arg(long)]
+    pub read_only: bool,
     /// Replay this many lines of history on attach, overriding the config.
     #[arg(long, value_name = "N")]
     pub scrollback: Option<u32>,
@@ -50,6 +56,28 @@ pub enum Command {
     Last,
     /// Open the ssht config file in $EDITOR.
     Edit,
+    /// List the tmux sessions running on a host.
+    Sessions {
+        /// Host alias to query.
+        host: String,
+    },
+    /// Kill a tmux session on a host.
+    Kill {
+        /// Host alias.
+        host: String,
+        /// Session to kill. Defaults to the host's configured session.
+        session: Option<String>,
+    },
+    /// Rename a tmux session on a host.
+    Rename {
+        /// Host alias.
+        host: String,
+        /// New session name.
+        new_name: String,
+        /// Session to rename. Defaults to the host's configured session.
+        #[arg(long, value_name = "NAME")]
+        session: Option<String>,
+    },
     /// Copy files to or from a host over the existing connection.
     ///
     /// Exactly one of SOURCE and DEST names a host, as `host:path`.

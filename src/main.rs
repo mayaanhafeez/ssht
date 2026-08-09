@@ -7,6 +7,7 @@ mod connect;
 mod model;
 mod mux;
 mod picker;
+mod registry;
 mod ssh_config;
 mod state;
 mod tmux;
@@ -20,6 +21,7 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command, VaultAction};
 use crate::config::{Config, Forwards};
+use crate::connect::ConnectOptions;
 use crate::model::{merge_hosts, Host};
 use crate::state::State;
 use crate::vault::{HostSettings, LazyVault, Vault};
@@ -32,10 +34,15 @@ async fn main() -> Result<()> {
     let state = State::open().context("opening state database")?;
     let mut vault = LazyVault::new();
 
-    let forwards = Forwards {
-        local: cli.local_forward.clone(),
-        remote: cli.remote_forward.clone(),
-        dynamic: cli.dynamic_forward.clone(),
+    let opts = ConnectOptions {
+        no_reconnect: cli.no_reconnect,
+        forwards: Forwards {
+            local: cli.local_forward.clone(),
+            remote: cli.remote_forward.clone(),
+            dynamic: cli.dynamic_forward.clone(),
+        },
+        read_only: cli.read_only,
+        scrollback: cli.scrollback,
     };
 
     match cli.command {
@@ -46,10 +53,18 @@ async fn main() -> Result<()> {
             cli.layout.as_deref(),
             &cli.ssh_args,
             &mut vault,
-            &forwards,
-            cli.scrollback,
+            &opts,
         ),
         Some(Command::Edit) => cmd_edit(),
+        Some(Command::Sessions { host }) => cmd_sessions(&host, &mut vault),
+        Some(Command::Kill { host, session }) => {
+            cmd_kill(&host, session.as_deref(), &config, &mut vault)
+        }
+        Some(Command::Rename {
+            host,
+            new_name,
+            session,
+        }) => cmd_rename(&host, session.as_deref(), &new_name, &config, &mut vault),
         Some(Command::Cp {
             source,
             dest,
@@ -64,8 +79,7 @@ async fn main() -> Result<()> {
                 cli.layout.as_deref(),
                 &cli.ssh_args,
                 &mut vault,
-                &forwards,
-                cli.scrollback,
+                &opts,
             ),
             None => cmd_picker(
                 &config,
@@ -73,8 +87,7 @@ async fn main() -> Result<()> {
                 cli.layout.as_deref(),
                 &cli.ssh_args,
                 &mut vault,
-                &forwards,
-                cli.scrollback,
+                &opts,
             )
             .await,
         },
@@ -190,18 +203,64 @@ fn cmd_last(
     layout: Option<&str>,
     ssh_args: &[String],
     vault: &mut LazyVault,
-    forwards: &Forwards,
-    scrollback: Option<u32>,
+    opts: &ConnectOptions,
 ) -> Result<()> {
     match state.last_host()? {
         Some(alias) => {
             eprintln!("Reconnecting to {alias}…");
-            connect::connect(&alias, config, state, layout, ssh_args, vault, forwards, scrollback)
+            connect::connect(&alias, config, state, layout, ssh_args, vault, opts)
         }
         None => {
             anyhow::bail!("no previous connection recorded yet");
         }
     }
+}
+
+fn cmd_sessions(host: &str, vault: &mut LazyVault) -> Result<()> {
+    let sessions = registry::list(host, vault)?;
+    if sessions.is_empty() {
+        eprintln!("No tmux sessions running on {host}");
+        return Ok(());
+    }
+    println!("{:<24} {:>7}  {}", "SESSION", "WINDOWS", "ATTACHED");
+    for s in &sessions {
+        println!(
+            "{:<24} {:>7}  {}",
+            s.name,
+            s.windows,
+            if s.attached { "yes" } else { "no" }
+        );
+    }
+    Ok(())
+}
+
+fn cmd_kill(
+    host: &str,
+    session: Option<&str>,
+    config: &Config,
+    vault: &mut LazyVault,
+) -> Result<()> {
+    let session = session
+        .map(str::to_string)
+        .unwrap_or_else(|| config.session_for(host));
+    registry::kill(host, &session, vault)?;
+    eprintln!("Killed session {session:?} on {host}");
+    Ok(())
+}
+
+fn cmd_rename(
+    host: &str,
+    session: Option<&str>,
+    new_name: &str,
+    config: &Config,
+    vault: &mut LazyVault,
+) -> Result<()> {
+    let session = session
+        .map(str::to_string)
+        .unwrap_or_else(|| config.session_for(host));
+    registry::rename(host, &session, new_name, vault)?;
+    eprintln!("Renamed session {session:?} to {new_name:?} on {host}");
+    Ok(())
 }
 
 fn cmd_edit() -> Result<()> {
@@ -225,8 +284,7 @@ async fn cmd_picker(
     layout: Option<&str>,
     ssh_args: &[String],
     vault: &mut LazyVault,
-    forwards: &Forwards,
-    scrollback: Option<u32>,
+    opts: &ConnectOptions,
 ) -> Result<()> {
     let hosts = load_hosts(config, state)?;
     if hosts.is_empty() {
@@ -245,7 +303,7 @@ async fn cmd_picker(
 
     match selection {
         Some(alias) => {
-            connect::connect(&alias, config, state, layout, ssh_args, vault, forwards, scrollback)
+            connect::connect(&alias, config, state, layout, ssh_args, vault, opts)
         }
         None => Ok(()),
     }
