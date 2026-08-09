@@ -184,6 +184,18 @@ ssht prod-web -- -L 8080:localhost:80   # everything after -- goes straight to s
 
 Anything after `--` is passed verbatim to the underlying `ssh` invocation, so port forwarding, agent forwarding, and one-off options all work without ssht needing to know about them.
 
+#### High-latency typing
+
+Use `--local-echo` to edit ordinary shell lines locally and send the completed line on Enter:
+
+```
+ssht prod-web --local-echo
+```
+
+This makes typing at shell prompts immediate without a server component. Full-screen applications such as vim, less, and htop automatically use raw SSH passthrough when they enter the alternate screen. Tab completion, history search, arrow keys, and other operations requiring remote state flush the current line and fall back to passthrough until Enter. Press `Ctrl-]` to toggle the feature while connected.
+
+The mode is opt-in because SSH does not report when a remote program disables echo. ssht recognizes common password, passphrase, PIN, and verification-code prompts and disables local drawing for the next line, but this is a heuristic. Leave local echo off when interacting with an unusual secret prompt.
+
 ### `ssht list` — scriptable output
 
 Prints every known host, one per line, with no decoration — meant for piping:

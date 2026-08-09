@@ -22,6 +22,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_reconnect: bool,
 
+    /// Edit shell lines locally for instant echo on high-latency links.
+    #[arg(long)]
+    pub local_echo: bool,
+
     /// Local port forward, as `ssh -L`. Repeatable; adds to configured ones.
     #[arg(short = 'L', value_name = "SPEC")]
     pub local_forward: Vec<String>,

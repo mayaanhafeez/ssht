@@ -3,9 +3,9 @@
 Research notes and a working prototype, investigating whether `ssht` can make
 typing over a high-latency link feel responsive.
 
-**Status:** prototype built and tested (`demo/localecho.py`). No decision made
-on shipping it. The deciding experiment is in [Before building anything](#before-building-anything)
-and takes two minutes.
+**Status:** prototype built and tested (`demo/localecho.py`), then ported to the
+main application as the opt-in `--local-echo` mode. It remains opt-in because
+password-prompt detection is necessarily heuristic over SSH.
 
 ---
 
@@ -195,17 +195,23 @@ it over SSH is that you can't tell when you're in that state.
 
 ## The key finding
 
-You can't ask, but you can **watch**. Since ssht proxies the byte stream,
-alternate-screen entry is visible in-band:
+The standalone SSH prototype can watch alternate-screen entry in-band:
 
 ```
 \e[?1049h   enter   (also legacy \e[?1047h, \e[?47h)
 \e[?1049l   exit
 ```
 
-That's an instant, reliable, zero-round-trip signal for "vim/htop/less just took
-over" — the same signal `scrollback_replay` already relies on via tmux's
-`alternate_on` (`src/tmux.rs:38`), but observed locally instead of asked for.
+The main application adds one important complication discovered during the Rust
+port: tmux owns the outer alternate screen for the lifetime of the attachment
+and consumes pane-level transitions. The local SSH stream therefore cannot see
+when vim/htop/less enters it. The shipped opt-in mode runs a lightweight remote
+watcher that polls tmux's `alternate_on` at 50ms intervals and emits private
+in-band state markers. Markers are repeated so an output interleave self-heals
+on the next poll. This remains zero-RTT from the client's perspective, at the
+cost of a small remote polling process while the mode is active. If the remote
+`sleep` does not support fractional seconds, the watcher safely leaves local
+editing disabled rather than entering a tight loop.
 
 **A tmux-based alternative was investigated and rejected.** tmux 3.2+ offers
 format subscriptions via `refresh-client -B name:what:format`, pushing
@@ -217,7 +223,8 @@ against the tmux 3.7b man page:
 > `%subscription-changed` notification, **at most once a second**.
 
 A full second of staleness about whether you're in vim is far worse than the RTT
-being hidden. Scrap it; parse the stream locally.
+being hidden. The implementation therefore uses the short-lived watcher above
+rather than tmux's subscription mechanism.
 
 ---
 

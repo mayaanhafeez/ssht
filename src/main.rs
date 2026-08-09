@@ -4,6 +4,7 @@
 mod cli;
 mod config;
 mod connect;
+mod local_echo;
 mod model;
 mod mux;
 mod picker;
@@ -35,6 +36,7 @@ async fn main() -> Result<()> {
     let mut vault = LazyVault::new();
 
     let opts = ConnectOptions {
+        local_echo: cli.local_echo,
         no_reconnect: cli.no_reconnect,
         forwards: Forwards {
             local: cli.local_forward.clone(),

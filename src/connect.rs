@@ -1,11 +1,22 @@
 //! Performing the actual SSH + tmux connection by shelling out to `ssh`.
 
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(unix)]
+use std::io::{ErrorKind, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::process::{Child, Stdio};
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
 use crate::config::{Config, Forwards};
+use crate::local_echo::LocalEcho;
 use crate::mux;
 use crate::state::State;
 use crate::tmux;
@@ -58,8 +69,10 @@ impl ReconnectPolicy {
 /// struct because these arrive from several independent places — flags, config,
 /// the picker — and threading them as positional parameters made every call
 /// site a wall of bare booleans.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct ConnectOptions {
+    /// Edit ordinary shell lines locally, outside the alternate screen.
+    pub local_echo: bool,
     /// Exit when the transport drops instead of re-attaching.
     pub no_reconnect: bool,
     /// Port forwards from the command line, merged with configured ones.
@@ -108,6 +121,17 @@ pub fn connect(
     // duplication compounds on every attempt.
     let first_attach = tmux::build_remote_command(&session, layout, opts.read_only, scrollback_lines);
     let reattach = tmux::build_remote_command(&session, layout, opts.read_only, 0);
+    let local_echo = local_echo_available(opts.local_echo && !opts.read_only);
+    let first_attach = if local_echo {
+        tmux::with_alt_screen_watcher(&session, &first_attach)
+    } else {
+        first_attach
+    };
+    let reattach = if local_echo {
+        tmux::with_alt_screen_watcher(&session, &reattach)
+    } else {
+        reattach
+    };
 
     state
         .record_connection(alias)
@@ -138,6 +162,7 @@ pub fn connect(
             &forward_args,
             ssh_passthrough,
             remote,
+            local_echo,
         )?;
         let elapsed = started.elapsed();
 
@@ -177,6 +202,18 @@ pub fn connect(
     }
 }
 
+fn local_echo_available(requested: bool) -> bool {
+    #[cfg(unix)]
+    {
+        requested && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = requested;
+        false
+    }
+}
+
 /// Spawn one `ssh` invocation and wait for it. Built fresh per attempt so the
 /// askpass scratch directory is recreated and torn down around each try.
 fn run_ssh(
@@ -187,6 +224,7 @@ fn run_ssh(
     forward_args: &[String],
     ssh_passthrough: &[String],
     remote: &str,
+    local_echo: bool,
 ) -> Result<ExitStatus> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-t");
@@ -212,8 +250,216 @@ fn run_ssh(
     cmd.arg(target);
     cmd.arg(remote);
 
+    #[cfg(unix)]
+    if local_echo && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        return run_with_local_echo(&mut cmd)
+            .with_context(|| format!("launching ssh to {target} (is ssh installed?)"));
+    }
+
+    #[cfg(not(unix))]
+    let _ = local_echo;
+
     cmd.status()
         .with_context(|| format!("launching ssh to {target} (is ssh installed?)"))
+}
+
+/// Run ssh behind a local PTY so its terminal behavior remains unchanged while
+/// ssht relays and edits the byte stream.
+#[cfg(unix)]
+fn run_with_local_echo(cmd: &mut Command) -> Result<ExitStatus> {
+    let mut winsize = terminal_winsize();
+    let mut master_fd = -1;
+    let mut slave_fd = -1;
+    let rc = unsafe {
+        libc::openpty(
+            &mut master_fd,
+            &mut slave_fd,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            winsize
+                .as_mut()
+                .map_or(std::ptr::null_mut(), |size| size as *mut libc::winsize),
+        )
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error()).context("opening local PTY");
+    }
+
+    let mut master = unsafe { File::from_raw_fd(master_fd) };
+    let slave = unsafe { File::from_raw_fd(slave_fd) };
+    cmd.stdin(Stdio::from(slave.try_clone()?));
+    cmd.stdout(Stdio::from(slave.try_clone()?));
+    cmd.stderr(Stdio::from(slave));
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let _raw = RawTerminal::new()?;
+    let mut child = ChildGuard::new(cmd.spawn()?);
+    let stdin = std::io::stdin();
+    let mut stdin_lock = stdin.lock();
+    let stdout = std::io::stdout();
+    let mut stdout_lock = stdout.lock();
+    let mut editor = LocalEcho::new(true);
+    let mut last_size = winsize.map(|s| (s.ws_row, s.ws_col));
+    let mut input_open = true;
+    let mut buf = [0u8; 65_536];
+
+    'relay: loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: if input_open { stdin.as_raw_fd() } else { -1 },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: master.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 100) };
+        if ready < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err).context("polling SSH PTY");
+        }
+
+        if let Some(size) = terminal_winsize() {
+            let dimensions = (size.ws_row, size.ws_col);
+            if Some(dimensions) != last_size {
+                unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size) };
+                unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGWINCH) };
+                last_size = Some(dimensions);
+            }
+        }
+
+        if fds[0].revents & libc::POLLIN != 0 {
+            let n = stdin_lock.read(&mut buf)?;
+            if n == 0 {
+                input_open = false;
+                master.write_all(&[0x04])?;
+            } else {
+                let action = editor.on_input(&buf[..n]);
+                if !write_pty(&mut master, &action.to_remote)? {
+                    break 'relay;
+                }
+                stdout_lock.write_all(&action.to_terminal)?;
+                stdout_lock.flush()?;
+            }
+        }
+
+        if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            match master.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let action = editor.on_output(&buf[..n]);
+                    if !write_pty(&mut master, &action.to_remote)? {
+                        break 'relay;
+                    }
+                    stdout_lock.write_all(&action.to_terminal)?;
+                    stdout_lock.flush()?;
+                }
+                Err(err) if err.raw_os_error() == Some(libc::EIO) => break,
+                Err(err) => return Err(err).context("reading SSH PTY"),
+            }
+        }
+
+        if fds[1].revents & libc::POLLNVAL != 0 {
+            break;
+        }
+    }
+
+    child.wait().context("waiting for ssh")
+}
+
+#[cfg(unix)]
+fn write_pty(master: &mut File, data: &[u8]) -> std::io::Result<bool> {
+    match master.write_all(data) {
+        Ok(()) => Ok(true),
+        Err(err)
+            if err.kind() == ErrorKind::BrokenPipe || err.raw_os_error() == Some(libc::EIO) =>
+        {
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(unix)]
+fn terminal_winsize() -> Option<libc::winsize> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let rc = unsafe { libc::ioctl(std::io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
+    (rc == 0).then_some(size)
+}
+
+#[cfg(unix)]
+struct RawTerminal;
+
+#[cfg(unix)]
+impl RawTerminal {
+    fn new() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode().context("enabling terminal raw mode")?;
+        Ok(Self)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawTerminal {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(unix)]
+struct ChildGuard {
+    child: Child,
+    completed: bool,
+}
+
+#[cfg(unix)]
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self {
+            child,
+            completed: false,
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        let status = self.child.wait()?;
+        self.completed = true;
+        Ok(status)
+    }
+
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
 }
 
 #[cfg(test)]

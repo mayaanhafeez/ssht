@@ -114,6 +114,22 @@ pub fn build_remote_command(
     )
 }
 
+/// Wrap an attach command with a lightweight remote watcher that reports the
+/// active pane's alternate-screen state in-band. tmux owns the outer alternate
+/// screen and consumes pane-level 1049 transitions, so they are not otherwise
+/// visible to the local SSH relay.
+pub fn with_alt_screen_watcher(session: &str, command: &str) -> String {
+    let session = sh_quote(session);
+    let format = sh_quote("#{alternate_on}");
+    format!(
+        "(if ! sleep 0.05 2>/dev/null; then printf '\\033P+ssht;alt=1\\033\\\\'; exit; fi; \
+         while :; do state=$(tmux display-message -p -t {session} {format} 2>/dev/null) || {{ sleep 0.05; continue; }}; \
+         printf '\\033P+ssht;alt=%s\\033\\\\\\033P+ssht;alt=%s\\033\\\\' \"$state\" \"$state\"; \
+         sleep 0.05; done) & watcher=$!; {command}; status=$?; \
+         kill \"$watcher\" 2>/dev/null; wait \"$watcher\" 2>/dev/null; exit $status"
+    )
+}
+
 /// Result of a background tmux status probe.
 #[derive(Debug, Clone)]
 pub struct TmuxStatus {
@@ -271,5 +287,24 @@ mod tests {
         assert!(cmd.contains("tmux send-keys -t 'dev:0' 'nvim' C-m"));
         assert!(cmd.contains("tmux new-window -t 'dev' -n 'shell'"));
         assert!(cmd.contains("tmux attach -t 'dev'"));
+    }
+
+    #[test]
+    fn alt_screen_watcher_reports_state_and_preserves_status() {
+        let cmd = with_alt_screen_watcher("dev box", "tmux attach -t 'dev box'");
+        assert!(cmd.contains("'#{alternate_on}'"));
+        assert!(cmd.contains("\\033P+ssht;alt=%s\\033\\\\\\033P+ssht;alt=%s"));
+        assert!(cmd.contains("if ! sleep 0.05"));
+        assert!(cmd.contains("-t 'dev box'"));
+        assert!(cmd.ends_with("exit $status"));
+
+        #[cfg(unix)]
+        assert!(
+            std::process::Command::new("sh")
+                .args(["-n", "-c", &cmd])
+                .status()
+                .expect("run shell syntax check")
+                .success()
+        );
     }
 }
