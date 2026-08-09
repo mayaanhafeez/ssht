@@ -28,3 +28,7 @@ CLAUDE.local.md
 
 # Local planning notes
 .plans/
+
+# Python bytecode (demo/)
+__pycache__/
+*.pyc
