@@ -2,6 +2,10 @@
 
 const ALT_ENTER: &[u8] = b"\x1bP+ssht;alt=1\x1b\\";
 const ALT_EXIT: &[u8] = b"\x1bP+ssht;alt=0\x1b\\";
+const READY: &[u8] = b"\x1bP+ssht;ready\x1b\\";
+const ARM: &[u8] = b"\x1bP+ssht;arm\x1b\\";
+const FOCUS_IN: &[u8] = b"\x1b[I";
+const FOCUS_OUT: &[u8] = b"\x1b[O";
 const PASSWORD_HINTS: [&[u8]; 4] = [b"assword", b"assphrase", b"PIN", b"Verification code"];
 const TOGGLE_KEY: u8 = 0x1d; // Ctrl-]
 const BAILOUT_KEYS: [u8; 11] = [
@@ -22,7 +26,7 @@ pub struct LocalEcho {
     disarm_next_line: bool,
     line: Vec<u8>,
     pending_echo: Vec<u8>,
-    scan_tail: Vec<u8>,
+    prompt_line: Vec<u8>,
     marker_buf: Vec<u8>,
 }
 
@@ -35,7 +39,7 @@ impl LocalEcho {
             disarm_next_line: false,
             line: Vec::new(),
             pending_echo: Vec::new(),
-            scan_tail: Vec::new(),
+            prompt_line: Vec::new(),
             marker_buf: Vec::new(),
         }
     }
@@ -70,28 +74,29 @@ impl LocalEcho {
             }
         }
 
-        let old_len = self.scan_tail.len();
-        let mut scan = std::mem::take(&mut self.scan_tail);
-        scan.extend_from_slice(visible);
-
-        if PASSWORD_HINTS
-            .iter()
-            .any(|hint| has_new_match(&scan, old_len, hint))
-        {
+        for &byte in visible {
+            if matches!(byte, b'\r' | b'\n') {
+                self.prompt_line.clear();
+            } else {
+                self.prompt_line.push(byte);
+                if self.prompt_line.len() > 256 {
+                    let excess = self.prompt_line.len() - 256;
+                    self.prompt_line.drain(..excess);
+                }
+            }
+        }
+        let secret_prompt = PASSWORD_HINTS.iter().any(|hint| {
+            self.prompt_line
+                .windows(hint.len())
+                .any(|window| window == *hint)
+        });
+        if secret_prompt && !self.disarm_next_line {
             if !self.line.is_empty() {
                 self.line.clear();
                 action.to_terminal.extend_from_slice(b"\r\x1b[2K");
             }
-            self.disarm_next_line = true;
         }
-
-        let carry = PASSWORD_HINTS
-            .iter()
-            .map(|sequence| sequence.len())
-            .max()
-            .unwrap_or(1)
-            - 1;
-        self.scan_tail = scan[scan.len().saturating_sub(carry)..].to_vec();
+        self.disarm_next_line = secret_prompt;
         action.to_terminal.extend_from_slice(visible);
         action
     }
@@ -105,7 +110,10 @@ impl LocalEcho {
             }
 
             self.marker_buf.push(byte);
-            if ALT_ENTER.starts_with(&self.marker_buf) || ALT_EXIT.starts_with(&self.marker_buf) {
+            if [ALT_ENTER, ALT_EXIT, READY, ARM]
+                .iter()
+                .any(|marker| marker.starts_with(&self.marker_buf))
+            {
                 if self.marker_buf == ALT_ENTER {
                     if !self.alt_screen {
                         self.alt_screen = true;
@@ -116,6 +124,19 @@ impl LocalEcho {
                     self.marker_buf.clear();
                 } else if self.marker_buf == ALT_EXIT {
                     self.alt_screen = false;
+                    self.marker_buf.clear();
+                } else if self.marker_buf == READY {
+                    // Bootstrap output, including replayed scrollback, must not
+                    // affect the state of the first live shell prompt.
+                    self.suspended = false;
+                    self.disarm_next_line = false;
+                    self.prompt_line.clear();
+                    self.marker_buf.clear();
+                } else if self.marker_buf == ARM {
+                    // Terminal capability/focus replies generated while tmux
+                    // attaches may look like user escape keys. Re-arm after
+                    // that handshake without overriding secret-prompt safety.
+                    self.suspended = false;
                     self.marker_buf.clear();
                 }
                 continue;
@@ -128,7 +149,20 @@ impl LocalEcho {
 
     pub fn on_input(&mut self, data: &[u8]) -> RelayAction {
         let mut action = RelayAction::default();
-        for &byte in data {
+        let mut index = 0;
+        while index < data.len() {
+            if data[index..].starts_with(FOCUS_IN) {
+                action.to_remote.extend_from_slice(FOCUS_IN);
+                index += FOCUS_IN.len();
+                continue;
+            }
+            if data[index..].starts_with(FOCUS_OUT) {
+                action.to_remote.extend_from_slice(FOCUS_OUT);
+                index += FOCUS_OUT.len();
+                continue;
+            }
+            let byte = data[index];
+            index += 1;
             if byte == TOGGLE_KEY {
                 self.flush_line(&mut action.to_remote);
                 self.enabled = !self.enabled;
@@ -145,7 +179,7 @@ impl LocalEcho {
 
             if !self.line_mode() {
                 if matches!(byte, b'\r' | b'\n') {
-                    self.suspended = false;
+                    self.suspended = index < data.len();
                     self.disarm_next_line = false;
                 }
                 action.to_remote.push(byte);
@@ -156,6 +190,9 @@ impl LocalEcho {
                 b'\r' | b'\n' => {
                     self.flush_line(&mut action.to_remote);
                     action.to_remote.push(b'\r');
+                    // Do not locally paint subsequent lines from one paste;
+                    // remote output from earlier lines would interleave them.
+                    self.suspended = index < data.len();
                 }
                 0x7f | 0x08 => {
                     if pop_utf8_char(&mut self.line) {
@@ -209,13 +246,6 @@ impl LocalEcho {
         }
         action
     }
-}
-
-fn has_new_match(haystack: &[u8], old_len: usize, needle: &[u8]) -> bool {
-    haystack
-        .windows(needle.len())
-        .enumerate()
-        .any(|(index, window)| window == needle && index + needle.len() > old_len)
 }
 
 fn pop_utf8_char(line: &mut Vec<u8>) -> bool {
@@ -306,6 +336,53 @@ mod tests {
         assert!(prompt.to_terminal.starts_with(b"\r\x1b[2K"));
         assert_eq!(editor.on_input(b"secret\r").to_remote, b"secret\r");
         assert!(editor.on_input(b"next\r").to_remote.ends_with(b"\r"));
+    }
+
+    #[test]
+    fn password_text_in_redrawn_history_does_not_disarm_live_prompt() {
+        let mut editor = LocalEcho::new(true);
+        editor.on_output(b"old Password: prompt\r\n$ ");
+        assert_eq!(editor.on_input(b"fast").to_terminal, b"fast");
+    }
+
+    #[test]
+    fn terminal_focus_events_do_not_suspend_line_editing() {
+        let mut editor = LocalEcho::new(true);
+        assert_eq!(editor.on_input(FOCUS_IN).to_remote, FOCUS_IN);
+        assert_eq!(editor.on_input(FOCUS_OUT).to_remote, FOCUS_OUT);
+        assert_eq!(editor.on_input(b"fast").to_terminal, b"fast");
+    }
+
+    #[test]
+    fn attach_arm_clears_suspension_but_not_secret_prompt_protection() {
+        let mut editor = LocalEcho::new(true);
+        editor.on_input(b"\x1b[A");
+        assert_eq!(editor.on_input(b"slow").to_remote, b"slow");
+        editor.on_output(ARM);
+        assert_eq!(editor.on_input(b"fast").to_terminal, b"fast");
+
+        editor.on_output(b"Password: ");
+        editor.on_output(ARM);
+        assert_eq!(editor.on_input(b"secret").to_remote, b"secret");
+    }
+
+    #[test]
+    fn multiline_paste_does_not_draw_ahead_of_remote_output() {
+        let mut editor = LocalEcho::new(true);
+        let action = editor.on_input(b"one\ntwo\n");
+        assert_eq!(action.to_terminal, b"one");
+        assert_eq!(action.to_remote, b"one\rtwo\n");
+        assert_eq!(editor.on_input(b"next").to_terminal, b"next");
+    }
+
+    #[test]
+    fn ready_marker_rearms_after_bootstrap_output() {
+        let mut editor = LocalEcho::new(true);
+        editor.on_output(b"old Password: prompt from scrollback");
+        assert_eq!(editor.on_input(b"slow").to_remote, b"slow");
+
+        assert!(editor.on_output(READY).to_terminal.is_empty());
+        assert_eq!(editor.on_input(b"fast").to_terminal, b"fast");
     }
 
     #[test]

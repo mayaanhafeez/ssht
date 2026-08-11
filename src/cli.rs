@@ -23,8 +23,12 @@ pub struct Cli {
     pub no_reconnect: bool,
 
     /// Edit shell lines locally for instant echo on high-latency links.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "mosh")]
     pub local_echo: bool,
+
+    /// Connect with Mosh for roaming and predictive local echo.
+    #[arg(long, conflicts_with = "local_echo")]
+    pub mosh: bool,
 
     /// Local port forward, as `ssh -L`. Repeatable; adds to configured ones.
     #[arg(short = 'L', value_name = "SPEC")]
@@ -121,4 +125,21 @@ pub enum VaultAction {
     Status,
     /// Change the vault passphrase.
     ChangePassphrase,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mosh_and_local_echo_conflict() {
+        assert!(Cli::try_parse_from(["ssht", "--mosh", "--local-echo", "host"]).is_err());
+    }
+
+    #[test]
+    fn mosh_can_be_selected_for_a_host() {
+        let cli = Cli::try_parse_from(["ssht", "--mosh", "host"]).unwrap();
+        assert!(cli.mosh);
+        assert_eq!(cli.host.as_deref(), Some("host"));
+    }
 }

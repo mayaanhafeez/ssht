@@ -19,6 +19,7 @@ use crate::config::{Config, Forwards};
 use crate::local_echo::LocalEcho;
 use crate::mux;
 use crate::state::State;
+use crate::terminfo;
 use crate::tmux;
 use crate::vault::{self, LazyVault};
 
@@ -27,6 +28,22 @@ use crate::vault::{self, LazyVault};
 /// the *remote command's* exit status, which must not be treated as a transport
 /// problem.
 const SSH_FAILURE: i32 = 255;
+
+const MOSH_SERVER_BOOTSTRAP: &str = "\
+if command -v mosh-server >/dev/null 2>&1; then exit 0; fi; \
+printf 'ssht: mosh-server not found; installing mosh...\\n' >&2; \
+if command -v brew >/dev/null 2>&1; then brew install mosh; exit $?; fi; \
+if [ \"$(id -u)\" -eq 0 ]; then SUDO=; \
+elif command -v sudo >/dev/null 2>&1; then SUDO=sudo; \
+else printf 'ssht: installing mosh requires root or sudo\\n' >&2; exit 1; fi; \
+if command -v apt-get >/dev/null 2>&1; then $SUDO apt-get update && $SUDO apt-get install -y mosh; \
+elif command -v dnf >/dev/null 2>&1; then $SUDO dnf install -y mosh; \
+elif command -v yum >/dev/null 2>&1; then $SUDO yum install -y mosh; \
+elif command -v pacman >/dev/null 2>&1; then $SUDO pacman -Sy --noconfirm mosh; \
+elif command -v apk >/dev/null 2>&1; then $SUDO apk add mosh; \
+elif command -v zypper >/dev/null 2>&1; then $SUDO zypper --non-interactive install mosh; \
+else printf 'ssht: no supported package manager found for installing mosh\\n' >&2; exit 1; fi; \
+command -v mosh-server >/dev/null 2>&1";
 
 /// A session that stayed up at least this long counts as "established". If one
 /// of those drops it's a network flap rather than a host that won't have us, so
@@ -73,6 +90,8 @@ impl ReconnectPolicy {
 pub struct ConnectOptions {
     /// Edit ordinary shell lines locally, outside the alternate screen.
     pub local_echo: bool,
+    /// Use Mosh instead of SSH for the interactive terminal transport.
+    pub mosh: bool,
     /// Exit when the transport drops instead of re-attaching.
     pub no_reconnect: bool,
     /// Port forwards from the command line, merged with configured ones.
@@ -110,7 +129,8 @@ pub fn connect(
         );
     }
 
-    let scrollback_lines = opts.scrollback.unwrap_or(config.settings.scrollback_lines);
+    let configured_scrollback = opts.scrollback.unwrap_or(config.settings.scrollback_lines);
+    let scrollback_lines = if opts.mosh { 0 } else { configured_scrollback };
     let policy = ReconnectPolicy::from_config(config, opts.no_reconnect);
     let forward_args = config.forward_args(alias, &opts.forwards)?;
     let mux_args = mux::ssh_args(config);
@@ -119,9 +139,15 @@ pub fn connect(
     // terminal still holds everything printed before the drop, so replaying
     // again would just duplicate it -- and with an aggressive retry loop that
     // duplication compounds on every attempt.
-    let first_attach = tmux::build_remote_command(&session, layout, opts.read_only, scrollback_lines);
-    let reattach = tmux::build_remote_command(&session, layout, opts.read_only, 0);
-    let local_echo = local_echo_available(opts.local_echo && !opts.read_only);
+    let local_echo = local_echo_available(opts.local_echo && !opts.read_only && !opts.mosh);
+    let first_attach = tmux::build_remote_command(
+        &session,
+        layout,
+        opts.read_only,
+        scrollback_lines,
+        local_echo,
+    );
+    let reattach = tmux::build_remote_command(&session, layout, opts.read_only, 0, local_echo);
     let first_attach = if local_echo {
         tmux::with_alt_screen_watcher(&session, &first_attach)
     } else {
@@ -149,6 +175,45 @@ pub fn connect(
         .to_string();
     let username = settings.as_ref().and_then(|s| s.username.clone());
     let password = settings.as_ref().and_then(|s| s.password.clone());
+    let term_override = terminfo::ensure_remote(
+        &target,
+        username.as_deref(),
+        password.as_deref(),
+        &mux_args,
+        ssh_passthrough,
+    )?;
+    let first_attach = terminfo::apply_override(&first_attach, term_override.as_deref());
+    let reattach = terminfo::apply_override(&reattach, term_override.as_deref());
+
+    if opts.mosh {
+        if !forward_args.is_empty() {
+            anyhow::bail!(
+                "--mosh does not support SSH port forwarding; remove configured and command-line -L/-R/-D forwards"
+            );
+        }
+        if configured_scrollback > 0 {
+            eprintln!("ssht: --mosh disables tmux scrollback replay");
+        }
+        ensure_remote_mosh(
+            &target,
+            username.as_deref(),
+            password.as_deref(),
+            &mux_args,
+            ssh_passthrough,
+        )?;
+        let status = run_mosh(
+            &target,
+            username.as_deref(),
+            password.as_deref(),
+            &mux_args,
+            ssh_passthrough,
+            &first_attach,
+        )?;
+        if !status.success() {
+            anyhow::bail!("mosh connection to {alias} failed with {status}");
+        }
+        return Ok(());
+    }
 
     let mut attempt: u32 = 0;
     let mut remote = first_attach.as_str();
@@ -200,6 +265,79 @@ pub fn connect(
         );
         std::thread::sleep(delay);
     }
+}
+
+fn ensure_remote_mosh(
+    target: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    mux_args: &[String],
+    ssh_passthrough: &[String],
+) -> Result<()> {
+    let mut cmd = Command::new("ssh");
+    // A PTY lets sudo prompt when installation is required.
+    cmd.arg("-t");
+    cmd.args(mux_args);
+    cmd.args(ssh_passthrough);
+    if let Some(user) = username {
+        cmd.args(["-l", user]);
+    }
+    cmd.arg(target);
+    cmd.arg(MOSH_SERVER_BOOTSTRAP);
+
+    let _askpass_cleanup = password
+        .map(|password| vault::setup_ssh_askpass(&mut cmd, password))
+        .transpose()?;
+    let status = cmd
+        .status()
+        .with_context(|| format!("checking mosh-server on {target}"))?;
+    if !status.success() {
+        anyhow::bail!("could not install mosh-server on {target}");
+    }
+    Ok(())
+}
+
+fn run_mosh(
+    target: &str,
+    username: Option<&str>,
+    password: Option<&str>,
+    mux_args: &[String],
+    ssh_passthrough: &[String],
+    remote: &str,
+) -> Result<ExitStatus> {
+    let ssh_command = mosh_ssh_command(username, mux_args, ssh_passthrough);
+    let mut cmd = Command::new("mosh");
+    cmd.arg(format!("--ssh={ssh_command}"));
+    cmd.arg("--");
+    cmd.arg(target);
+    // The tmux bootstrap is a compound shell command, not one executable.
+    cmd.args(["sh", "-lc", remote]);
+
+    let _askpass_cleanup = password
+        .map(|password| vault::setup_ssh_askpass(&mut cmd, password))
+        .transpose()?;
+
+    cmd.status()
+        .with_context(|| "launching mosh (is mosh installed locally?)")
+}
+
+fn mosh_ssh_command(
+    username: Option<&str>,
+    mux_args: &[String],
+    ssh_passthrough: &[String],
+) -> String {
+    let mut parts = vec!["ssh".to_string()];
+    parts.extend_from_slice(mux_args);
+    parts.extend_from_slice(ssh_passthrough);
+    if let Some(user) = username {
+        parts.push("-l".to_string());
+        parts.push(user.to_string());
+    }
+    parts
+        .iter()
+        .map(|part| tmux::sh_quote(part))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn local_echo_available(requested: bool) -> bool {
@@ -499,8 +637,8 @@ mod tests {
         // Integration invariant: the first attach replays history, a reconnect
         // must not -- the local terminal still holds everything from before the
         // drop, so replaying again would duplicate it once per retry.
-        let first = tmux::build_remote_command("main", None, false, 500);
-        let reattach = tmux::build_remote_command("main", None, false, 0);
+        let first = tmux::build_remote_command("main", None, false, 500, false);
+        let reattach = tmux::build_remote_command("main", None, false, 0, false);
         assert!(first.contains("capture-pane"));
         assert!(!reattach.contains("capture-pane"));
     }
@@ -510,5 +648,27 @@ mod tests {
         let config = Config::default();
         assert!(ReconnectPolicy::from_config(&config, false).enabled);
         assert!(!ReconnectPolicy::from_config(&config, true).enabled);
+    }
+
+    #[test]
+    fn mosh_ssh_command_preserves_argument_boundaries() {
+        let mux = vec!["-o".into(), "ProxyCommand=jump host".into()];
+        let passthrough = vec!["-p".into(), "2222".into()];
+        assert_eq!(
+            mosh_ssh_command(Some("dev user"), &mux, &passthrough),
+            "'ssh' '-o' 'ProxyCommand=jump host' '-p' '2222' '-l' 'dev user'"
+        );
+    }
+
+    #[test]
+    fn mosh_server_bootstrap_is_valid_shell() {
+        #[cfg(unix)]
+        assert!(
+            Command::new("sh")
+                .args(["-n", "-c", MOSH_SERVER_BOOTSTRAP])
+                .status()
+                .expect("run shell syntax check")
+                .success()
+        );
     }
 }

@@ -40,7 +40,7 @@ It's written in Rust, and a few choices were deliberate:
 
 - **`tokio` for async background checks.** When the picker opens, the host list is already on screen — it doesn't wait on the network. The "is tmux running over there?" probes fire off concurrently in the background and the indicators fill in as answers come back. Opening the picker never blocks on a slow or unreachable host.
 
-The result is a single static binary with no runtime dependencies beyond `ssh` and `tmux` being on your `PATH`.
+The result is a single static binary with no required runtime dependencies beyond `ssh` and `tmux` being on your `PATH`. When available, local `infocmp` and remote `tic` are used to install missing terminal descriptions automatically.
 
 ## Installation
 
@@ -184,6 +184,14 @@ ssht prod-web -- -L 8080:localhost:80   # everything after -- goes straight to s
 
 Anything after `--` is passed verbatim to the underlying `ssh` invocation, so port forwarding, agent forwarding, and one-off options all work without ssht needing to know about them.
 
+#### Ghostty and Kitty
+
+Ghostty and Kitty identify themselves with terminal descriptions such as `xterm-ghostty` and `xterm-kitty`. Before attaching tmux, ssht exports the active local `TERM` with `infocmp`, checks the remote account, and installs a missing entry into `~/.terminfo` with `tic`. This also handles `tmux-256color` when ssht is launched from a local tmux pane. Installation is per remote user and does not modify system terminfo or another user's environment.
+
+If the local description cannot be exported or the remote host has no `tic`, ssht scopes `TERM=xterm-256color` to its remote attach command and reports the fallback. This preserves basic terminal operation but may omit terminal-specific capabilities.
+
+The normal SSH and Mosh paths preserve terminal traffic. The experimental `--local-echo` path is intended only for basic shell-line editing; modern keyboard, graphics, and terminal query protocols can require raw passthrough.
+
 #### High-latency typing
 
 Use `--local-echo` to edit ordinary shell lines locally and send the completed line on Enter:
@@ -195,6 +203,14 @@ ssht prod-web --local-echo
 This makes typing at shell prompts immediate without a server component. Full-screen applications such as vim, less, and htop automatically use raw SSH passthrough when they enter the alternate screen. Tab completion, history search, arrow keys, and other operations requiring remote state flush the current line and fall back to passthrough until Enter. Press `Ctrl-]` to toggle the feature while connected.
 
 The mode is opt-in because SSH does not report when a remote program disables echo. ssht recognizes common password, passphrase, PIN, and verification-code prompts and disables local drawing for the next line, but this is a heuristic. Leave local echo off when interacting with an unusual secret prompt.
+
+For predictive echo throughout the terminal and connections that survive network changes, use Mosh instead:
+
+```
+ssht prod-web --mosh
+```
+
+This requires `mosh` on the local machine and UDP ports 60000-61000 to be reachable by default. ssht checks for `mosh-server` when connecting and, when it is missing, installs the `mosh` package using Homebrew, apt, dnf, yum, pacman, apk, or zypper; `sudo` may prompt for the remote password. Mosh owns the terminal screen, so ssht disables tmux scrollback replay in this mode. Mosh does not support SSH port forwarding; `--mosh` returns an error when the host or command line configures `-L`, `-R`, or `-D`. `--mosh` and `--local-echo` are mutually exclusive.
 
 ### `ssht list` — scriptable output
 

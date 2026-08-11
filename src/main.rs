@@ -11,6 +11,7 @@ mod picker;
 mod registry;
 mod ssh_config;
 mod state;
+mod terminfo;
 mod tmux;
 mod util;
 mod vault;
@@ -37,6 +38,7 @@ async fn main() -> Result<()> {
 
     let opts = ConnectOptions {
         local_echo: cli.local_echo,
+        mosh: cli.mosh,
         no_reconnect: cli.no_reconnect,
         forwards: Forwards {
             local: cli.local_forward.clone(),
