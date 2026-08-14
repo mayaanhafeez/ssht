@@ -1,0 +1,170 @@
+name: Auto Release
+
+# Releases on every push to main: bumps the patch version, tags, publishes a
+# GitHub Release, and points the Homebrew formula at the new tag.
+#
+# Loop safety: the version-bump commit is pushed back to main using
+# GITHUB_TOKEN. GitHub deliberately does not trigger workflow runs for pushes
+# made with GITHUB_TOKEN, so that commit cannot re-enter this workflow. The
+# `[skip ci]` marker and the `if:` guard below are belt-and-braces on top.
+#
+# The *tag*, by contrast, is pushed with RELEASE_TOKEN (a PAT) precisely
+# because it must trigger something: release.yml listens on `v*.*.*` and
+# builds the .deb / .rpm / pacman assets. A tag pushed with GITHUB_TOKEN
+# would silently fail to start that workflow.
+on:
+  push:
+    branches: [main]
+
+# Never let two releases race for the same version number.
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    runs-on: ubuntu-latest
+    env:
+      # Job-level so the `if:` guards below can see it. Empty when the secret
+      # is unset, which makes those steps skip instead of fail.
+      RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Gate the release on a green build. A red main does not ship.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Check release profile
+        run: cargo check --release --locked
+
+      - name: Compute next version
+        id: version
+        run: |
+          set -euo pipefail
+          current=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/^version = "(.+)"/\1/')
+          IFS=. read -r major minor patch <<< "$current"
+          next="${major}.${minor}.$((patch + 1))"
+          if git rev-parse -q --verify "refs/tags/v${next}" >/dev/null; then
+            echo "Tag v${next} already exists — refusing to overwrite." >&2
+            exit 1
+          fi
+          echo "next=${next}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ${current} -> ${next}"
+
+      - name: Bump Cargo.toml and lockfile
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          # Replace only the first `version = ` line — that is the [package]
+          # version. A blind sed would rewrite dependency versions too.
+          python3 - <<'PY'
+          import os, re, pathlib
+          p = pathlib.Path("Cargo.toml")
+          s = p.read_text()
+          s, n = re.subn(r'^version = ".+"$',
+                         f'version = "{os.environ["NEXT"]}"',
+                         s, count=1, flags=re.M)
+          assert n == 1, "package version line not found in Cargo.toml"
+          p.write_text(s)
+          PY
+          # PKGBUILD's pkgver is overwritten from the tag by release.yml, but
+          # keep it honest in-tree so the checked-in file is not stale.
+          sed -i -E "s/^pkgver=.*/pkgver=${NEXT}/" PKGBUILD
+          # Refresh Cargo.lock's own record of the package version.
+          cargo check --quiet
+          grep -m1 '^version = ' Cargo.toml
+
+      - name: Commit and push version bump
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock PKGBUILD
+          git commit -m "Bump version to ${NEXT} [skip ci]"
+          # Pushed with the default GITHUB_TOKEN checkout credential, so this
+          # does not retrigger this workflow.
+          git push origin HEAD:main
+
+      - name: Push tag
+        if: env.RELEASE_TOKEN != ''
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          git tag -a "v${NEXT}" -m "v${NEXT}"
+          # PAT on purpose: this tag must trigger release.yml's package builds.
+          git push \
+            "https://x-access-token:${RELEASE_TOKEN}@github.com/${{ github.repository }}.git" \
+            "v${NEXT}"
+
+      - name: Create GitHub Release
+        if: env.RELEASE_TOKEN != ''
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # release.yml may already have created the release to hang its
+          # assets on, so tolerate it already existing.
+          gh release create "v${NEXT}" --title "v${NEXT}" --generate-notes \
+            || gh release edit "v${NEXT}" --title "v${NEXT}"
+
+      - name: Compute tarball checksum
+        id: checksum
+        if: env.RELEASE_TOKEN != ''
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          url="https://github.com/${{ github.repository }}/archive/refs/tags/v${NEXT}.tar.gz"
+          # The tarball is generated on demand; give it a moment to materialise.
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL -o release.tar.gz "$url"; then break; fi
+            echo "attempt ${attempt}: tarball not ready, retrying..."
+            sleep 5
+          done
+          sha=$(sha256sum release.tar.gz | cut -d' ' -f1)
+          # Re-download and compare: a wrong sha256 breaks `brew install` for
+          # everyone, so never publish one we have not seen twice.
+          curl -fsSL -o verify.tar.gz "$url"
+          if [ "$sha" != "$(sha256sum verify.tar.gz | cut -d' ' -f1)" ]; then
+            echo "Tarball checksum is not stable — aborting formula update." >&2
+            exit 1
+          fi
+          echo "sha256=${sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Update Homebrew formula
+        if: env.RELEASE_TOKEN != ''
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+          SHA256: ${{ steps.checksum.outputs.sha256 }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${RELEASE_TOKEN}@github.com/${OWNER}/homebrew-tap.git" tap
+          cd tap
+          sed -i -E \
+            -e "s|^  url \".*/tags/v.+\.tar\.gz\"|  url \"https://github.com/${OWNER}/ssht/archive/refs/tags/v${NEXT}.tar.gz\"|" \
+            -e "s|^  sha256 \".+\"|  sha256 \"${SHA256}\"|" \
+            Formula/ssht.rb
+          ruby -c Formula/ssht.rb
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/ssht.rb
+          git commit -m "ssht ${NEXT}"
+          git push origin HEAD:main
