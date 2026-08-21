@@ -29,6 +29,23 @@ use crate::vault::{self, LazyVault};
 /// problem.
 const SSH_FAILURE: i32 = 255;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionOutcome {
+    Complete,
+    Reconnect,
+    RemoteFailure,
+}
+
+fn connection_outcome(status: ExitStatus, read_only: bool) -> ConnectionOutcome {
+    if status.success() || (!read_only && status.code() != Some(SSH_FAILURE)) {
+        ConnectionOutcome::Complete
+    } else if status.code() == Some(SSH_FAILURE) {
+        ConnectionOutcome::Reconnect
+    } else {
+        ConnectionOutcome::RemoteFailure
+    }
+}
+
 const MOSH_SERVER_BOOTSTRAP: &str = "\
 if command -v mosh-server >/dev/null 2>&1; then exit 0; fi; \
 printf 'ssht: mosh-server not found; installing mosh...\\n' >&2; \
@@ -231,10 +248,14 @@ pub fn connect(
         )?;
         let elapsed = started.elapsed();
 
-        // A clean exit, or a failure from the remote command itself: either way
-        // the user is done with this session and must not be dragged back in.
-        if status.success() || status.code() != Some(SSH_FAILURE) {
-            return Ok(());
+        match connection_outcome(status, opts.read_only) {
+            // Interactive shell exit codes are not actionable, but read-only
+            // mode uses a non-zero status to report a missing target session.
+            ConnectionOutcome::Complete => return Ok(()),
+            ConnectionOutcome::RemoteFailure => {
+                anyhow::bail!("read-only connection to {alias} failed with {status}");
+            }
+            ConnectionOutcome::Reconnect => {}
         }
 
         if !policy.enabled {
@@ -604,6 +625,13 @@ impl Drop for ChildGuard {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(code << 8)
+    }
+
     fn policy() -> ReconnectPolicy {
         ReconnectPolicy {
             enabled: true,
@@ -650,6 +678,37 @@ mod tests {
         assert!(!ReconnectPolicy::from_config(&config, true).enabled);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn interactive_remote_failure_completes_the_session() {
+        assert_eq!(
+            connection_outcome(exit_status(1), false),
+            ConnectionOutcome::Complete
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_remote_failure_is_preserved() {
+        assert_eq!(
+            connection_outcome(exit_status(1), true),
+            ConnectionOutcome::RemoteFailure
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_failure_reconnects_in_both_modes() {
+        assert_eq!(
+            connection_outcome(exit_status(SSH_FAILURE), false),
+            ConnectionOutcome::Reconnect
+        );
+        assert_eq!(
+            connection_outcome(exit_status(SSH_FAILURE), true),
+            ConnectionOutcome::Reconnect
+        );
+    }
+
     #[test]
     fn mosh_ssh_command_preserves_argument_boundaries() {
         let mux = vec!["-o".into(), "ProxyCommand=jump host".into()];
@@ -663,12 +722,10 @@ mod tests {
     #[test]
     fn mosh_server_bootstrap_is_valid_shell() {
         #[cfg(unix)]
-        assert!(
-            Command::new("sh")
-                .args(["-n", "-c", MOSH_SERVER_BOOTSTRAP])
-                .status()
-                .expect("run shell syntax check")
-                .success()
-        );
+        assert!(Command::new("sh")
+            .args(["-n", "-c", MOSH_SERVER_BOOTSTRAP])
+            .status()
+            .expect("run shell syntax check")
+            .success());
     }
 }
