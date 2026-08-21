@@ -59,6 +59,11 @@ struct ReconnectPolicy {
     max_delay: Duration,
 }
 
+enum SshRun {
+    Exited(ExitStatus),
+    FailedAfterSpawn(anyhow::Error),
+}
+
 impl ReconnectPolicy {
     fn from_config(config: &Config, disabled_by_flag: bool) -> Self {
         let s = &config.settings;
@@ -215,29 +220,49 @@ pub fn connect(
         return Ok(());
     }
 
-    let mut attempt: u32 = 0;
-    let mut remote = first_attach.as_str();
-    loop {
-        let started = Instant::now();
-        let status = run_ssh(
-            &target,
-            username.as_deref(),
-            password.as_deref(),
-            &mux_args,
-            &forward_args,
-            ssh_passthrough,
-            remote,
-            local_echo,
-        )?;
-        let elapsed = started.elapsed();
+    supervise_ssh(
+        alias,
+        policy,
+        |first| {
+            let started = Instant::now();
+            let remote = if first { &first_attach } else { &reattach };
+            let outcome = run_ssh(
+                &target,
+                username.as_deref(),
+                password.as_deref(),
+                &mux_args,
+                &forward_args,
+                ssh_passthrough,
+                remote,
+                local_echo,
+            )?;
+            Ok((outcome, started.elapsed()))
+        },
+        std::thread::sleep,
+    )
+}
 
-        // A clean exit, or a failure from the remote command itself: either way
-        // the user is done with this session and must not be dragged back in.
-        if status.success() || status.code() != Some(SSH_FAILURE) {
-            return Ok(());
-        }
+fn supervise_ssh<R, S>(alias: &str, policy: ReconnectPolicy, mut run: R, mut sleep: S) -> Result<()>
+where
+    R: FnMut(bool) -> Result<(SshRun, Duration)>,
+    S: FnMut(Duration),
+{
+    let mut attempt: u32 = 0;
+    let mut first = true;
+    loop {
+        let (outcome, elapsed) = run(first)?;
+        let post_spawn_error = match outcome {
+            SshRun::Exited(status) if status.success() || status.code() != Some(SSH_FAILURE) => {
+                return Ok(());
+            }
+            SshRun::Exited(_) => None,
+            SshRun::FailedAfterSpawn(error) => Some(error),
+        };
 
         if !policy.enabled {
+            if let Some(error) = post_spawn_error {
+                return Err(error).context(format!("ssh connection to {alias} failed"));
+            }
             anyhow::bail!("ssh connection to {alias} failed");
         }
 
@@ -248,14 +273,19 @@ pub fn connect(
 
         attempt += 1;
         if attempt > policy.max_attempts {
+            if let Some(error) = post_spawn_error {
+                return Err(error).context(format!(
+                    "ssh connection to {alias} failed after {} reconnect attempts",
+                    policy.max_attempts
+                ));
+            }
             anyhow::bail!(
                 "ssh connection to {alias} failed after {} reconnect attempts",
                 policy.max_attempts
             );
         }
 
-        remote = reattach.as_str();
-
+        first = false;
         let delay = policy.delay_for(attempt);
         eprintln!(
             "Connection to {alias} lost — reconnecting in {}s (attempt {}/{})…",
@@ -263,7 +293,7 @@ pub fn connect(
             attempt,
             policy.max_attempts
         );
-        std::thread::sleep(delay);
+        sleep(delay);
     }
 }
 
@@ -363,7 +393,7 @@ fn run_ssh(
     ssh_passthrough: &[String],
     remote: &str,
     local_echo: bool,
-) -> Result<ExitStatus> {
+) -> Result<SshRun> {
     let mut cmd = Command::new("ssh");
     cmd.arg("-t");
     // Become the control master, so `ssht cp` to this host reuses the
@@ -398,13 +428,14 @@ fn run_ssh(
     let _ = local_echo;
 
     cmd.status()
+        .map(SshRun::Exited)
         .with_context(|| format!("launching ssh to {target} (is ssh installed?)"))
 }
 
 /// Run ssh behind a local PTY so its terminal behavior remains unchanged while
 /// ssht relays and edits the byte stream.
 #[cfg(unix)]
-fn run_with_local_echo(cmd: &mut Command) -> Result<ExitStatus> {
+fn run_with_local_echo(cmd: &mut Command) -> Result<SshRun> {
     let mut winsize = terminal_winsize();
     let mut master_fd = -1;
     let mut slave_fd = -1;
@@ -442,6 +473,17 @@ fn run_with_local_echo(cmd: &mut Command) -> Result<ExitStatus> {
 
     let _raw = RawTerminal::new()?;
     let mut child = ChildGuard::new(cmd.spawn()?);
+    run_local_echo_relay(&mut child, &mut master, winsize)
+        .map(SshRun::Exited)
+        .or_else(|error| Ok(SshRun::FailedAfterSpawn(error)))
+}
+
+#[cfg(unix)]
+fn run_local_echo_relay(
+    child: &mut ChildGuard,
+    master: &mut File,
+    winsize: Option<libc::winsize>,
+) -> Result<ExitStatus> {
     let stdin = std::io::stdin();
     let mut stdin_lock = stdin.lock();
     let stdout = std::io::stdout();
@@ -489,7 +531,7 @@ fn run_with_local_echo(cmd: &mut Command) -> Result<ExitStatus> {
                 master.write_all(&[0x04])?;
             } else {
                 let action = editor.on_input(&buf[..n]);
-                if !write_pty(&mut master, &action.to_remote)? {
+                if !write_pty(master, &action.to_remote)? {
                     break 'relay;
                 }
                 stdout_lock.write_all(&action.to_terminal)?;
@@ -502,7 +544,7 @@ fn run_with_local_echo(cmd: &mut Command) -> Result<ExitStatus> {
                 Ok(0) => break,
                 Ok(n) => {
                     let action = editor.on_output(&buf[..n]);
-                    if !write_pty(&mut master, &action.to_remote)? {
+                    if !write_pty(master, &action.to_remote)? {
                         break 'relay;
                     }
                     stdout_lock.write_all(&action.to_terminal)?;
@@ -604,6 +646,13 @@ impl Drop for ChildGuard {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    fn exit_status(code: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(code << 8)
+    }
+
     fn policy() -> ReconnectPolicy {
         ReconnectPolicy {
             enabled: true,
@@ -650,6 +699,99 @@ mod tests {
         assert!(!ReconnectPolicy::from_config(&config, true).enabled);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn retries_transport_failures_with_backoff() {
+        let mut outcomes = vec![0, SSH_FAILURE, SSH_FAILURE].into_iter().rev();
+        let mut first_flags = Vec::new();
+        let mut delays = Vec::new();
+        supervise_ssh(
+            "host",
+            policy(),
+            |first| {
+                first_flags.push(first);
+                Ok((
+                    SshRun::Exited(exit_status(outcomes.next().unwrap())),
+                    Duration::ZERO,
+                ))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+        assert_eq!(first_flags, [true, false, false]);
+        assert_eq!(delays, [Duration::from_secs(1), Duration::from_secs(2)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retries_failures_after_ssh_has_spawned() {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        supervise_ssh(
+            "host",
+            policy(),
+            |_| {
+                calls += 1;
+                let outcome = if calls == 1 {
+                    SshRun::FailedAfterSpawn(anyhow::anyhow!("relay failed"))
+                } else {
+                    SshRun::Exited(exit_status(0))
+                };
+                Ok((outcome, Duration::ZERO))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(delays, [Duration::from_secs(1)]);
+    }
+
+    #[test]
+    fn pre_spawn_errors_are_not_retried() {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let error = supervise_ssh(
+            "host",
+            policy(),
+            |_| {
+                calls += 1;
+                anyhow::bail!("ssh executable not found")
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(delays.is_empty());
+        assert!(error.to_string().contains("ssh executable not found"));
+    }
+
+    #[test]
+    fn reconnect_limit_preserves_post_spawn_error() {
+        let mut p = policy();
+        p.max_attempts = 2;
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        let error = supervise_ssh(
+            "host",
+            p,
+            |_| {
+                calls += 1;
+                Ok((
+                    SshRun::FailedAfterSpawn(anyhow::anyhow!("relay failed")),
+                    Duration::ZERO,
+                ))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap_err();
+        assert_eq!(calls, 3);
+        assert_eq!(delays, [Duration::from_secs(1), Duration::from_secs(2)]);
+        assert!(error
+            .to_string()
+            .contains("failed after 2 reconnect attempts"));
+        assert!(format!("{error:#}").contains("relay failed"));
+    }
+
     #[test]
     fn mosh_ssh_command_preserves_argument_boundaries() {
         let mux = vec!["-o".into(), "ProxyCommand=jump host".into()];
@@ -663,12 +805,10 @@ mod tests {
     #[test]
     fn mosh_server_bootstrap_is_valid_shell() {
         #[cfg(unix)]
-        assert!(
-            Command::new("sh")
-                .args(["-n", "-c", MOSH_SERVER_BOOTSTRAP])
-                .status()
-                .expect("run shell syntax check")
-                .success()
-        );
+        assert!(Command::new("sh")
+            .args(["-n", "-c", MOSH_SERVER_BOOTSTRAP])
+            .status()
+            .expect("run shell syntax check")
+            .success());
     }
 }
