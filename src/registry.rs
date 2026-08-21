@@ -17,7 +17,7 @@ use crate::vault::{self, LazyVault};
 pub struct SessionInfo {
     pub name: String,
     pub windows: u32,
-    pub attached: bool,
+    pub clients: u32,
 }
 
 /// Tab-separated, one line per session. Explicit format rather than parsing
@@ -36,11 +36,11 @@ fn parse_sessions(stdout: &str) -> Vec<SessionInfo> {
                 return None;
             }
             let windows = fields.next()?.trim().parse().ok()?;
-            let attached = fields.next()?.trim() != "0";
+            let clients = fields.next()?.trim().parse().ok()?;
             Some(SessionInfo {
                 name: name.to_string(),
                 windows,
-                attached,
+                clients,
             })
         })
         .collect()
@@ -111,11 +111,7 @@ pub fn kill(alias: &str, session: &str, vault: &mut LazyVault) -> Result<()> {
 
 /// Rename a tmux session on `alias`.
 pub fn rename(alias: &str, from: &str, to: &str, vault: &mut LazyVault) -> Result<()> {
-    let remote = format!(
-        "tmux rename-session -t {} {}",
-        sh_quote(from),
-        sh_quote(to)
-    );
+    let remote = format!("tmux rename-session -t {} {}", sh_quote(from), sh_quote(to));
     let out = run_remote(alias, vault, &remote)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -134,8 +130,16 @@ mod tests {
         assert_eq!(
             parse_sessions(out),
             vec![
-                SessionInfo { name: "main".into(), windows: 3, attached: true },
-                SessionInfo { name: "build".into(), windows: 1, attached: false },
+                SessionInfo {
+                    name: "main".into(),
+                    windows: 3,
+                    clients: 1
+                },
+                SessionInfo {
+                    name: "build".into(),
+                    windows: 1,
+                    clients: 0
+                },
             ]
         );
     }
@@ -156,9 +160,8 @@ mod tests {
     }
 
     #[test]
-    fn attached_is_any_nonzero_count() {
-        // tmux reports a client *count*, not a boolean.
+    fn preserves_attached_client_count() {
         let sessions = parse_sessions("main\t1\t2\n");
-        assert!(sessions[0].attached);
+        assert_eq!(sessions[0].clients, 2);
     }
 }
