@@ -64,6 +64,37 @@ enum SshRun {
     FailedAfterSpawn(anyhow::Error),
 }
 
+enum SshOutcome {
+    Complete,
+    Reconnect,
+    UserTerminated,
+}
+
+fn classify_ssh_exit(status: ExitStatus) -> SshOutcome {
+    if status.success() {
+        return SshOutcome::Complete;
+    }
+    if status.code() == Some(SSH_FAILURE) {
+        return SshOutcome::Reconnect;
+    }
+    if status.code().is_some() {
+        return SshOutcome::Complete;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        return match status.signal() {
+            Some(libc::SIGINT | libc::SIGTERM | libc::SIGHUP) => SshOutcome::UserTerminated,
+            Some(_) | None => SshOutcome::Reconnect,
+        };
+    }
+
+    #[cfg(not(unix))]
+    SshOutcome::Reconnect
+}
+
 impl ReconnectPolicy {
     fn from_config(config: &Config, disabled_by_flag: bool) -> Self {
         let s = &config.settings;
@@ -252,10 +283,10 @@ where
     loop {
         let (outcome, elapsed) = run(first)?;
         let post_spawn_error = match outcome {
-            SshRun::Exited(status) if status.success() || status.code() != Some(SSH_FAILURE) => {
-                return Ok(());
-            }
-            SshRun::Exited(_) => None,
+            SshRun::Exited(status) => match classify_ssh_exit(status) {
+                SshOutcome::Complete | SshOutcome::UserTerminated => return Ok(()),
+                SshOutcome::Reconnect => None,
+            },
             SshRun::FailedAfterSpawn(error) => Some(error),
         };
 
@@ -653,6 +684,13 @@ mod tests {
         ExitStatus::from_raw(code << 8)
     }
 
+    #[cfg(unix)]
+    fn signaled(signal: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(signal)
+    }
+
     fn policy() -> ReconnectPolicy {
         ReconnectPolicy {
             enabled: true,
@@ -790,6 +828,71 @@ mod tests {
             .to_string()
             .contains("failed after 2 reconnect attempts"));
         assert!(format!("{error:#}").contains("relay failed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retries_ssh_crashes() {
+        for signal in [libc::SIGKILL, libc::SIGSEGV, libc::SIGABRT] {
+            assert!(matches!(
+                classify_ssh_exit(signaled(signal)),
+                SshOutcome::Reconnect
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_termination_signals_do_not_reconnect() {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            assert!(matches!(
+                classify_ssh_exit(signaled(signal)),
+                SshOutcome::UserTerminated
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_ssh_uses_the_reconnect_budget() {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        supervise_ssh(
+            "host",
+            policy(),
+            |_| {
+                calls += 1;
+                let status = if calls == 1 {
+                    signaled(libc::SIGKILL)
+                } else {
+                    exit_status(0)
+                };
+                Ok((SshRun::Exited(status), Duration::ZERO))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(delays, [Duration::from_secs(1)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_terminated_ssh_stops_without_backoff() {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        supervise_ssh(
+            "host",
+            policy(),
+            |_| {
+                calls += 1;
+                Ok((SshRun::Exited(signaled(libc::SIGINT)), Duration::ZERO))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(delays.is_empty());
     }
 
     #[test]
