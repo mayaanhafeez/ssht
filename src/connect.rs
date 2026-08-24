@@ -36,16 +36,46 @@ enum ConnectionOutcome {
     Complete,
     Reconnect,
     RemoteFailure,
+    UserTerminated,
 }
 
+/// Decide what a finished `ssh` means for the reconnect loop.
+///
+/// Three signals are folded together here: ssh's own 255, the remote command's
+/// exit code (which read-only mode reports rather than swallows), and — when
+/// ssh left no exit code at all — the signal that killed it.
 fn connection_outcome(status: ExitStatus, read_only: bool) -> ConnectionOutcome {
-    if status.success() || (!read_only && status.code() != Some(SSH_FAILURE)) {
-        ConnectionOutcome::Complete
-    } else if status.code() == Some(SSH_FAILURE) {
-        ConnectionOutcome::Reconnect
-    } else {
-        ConnectionOutcome::RemoteFailure
+    if status.success() {
+        return ConnectionOutcome::Complete;
     }
+    if status.code() == Some(SSH_FAILURE) {
+        return ConnectionOutcome::Reconnect;
+    }
+    if status.code().is_some() {
+        // A status from the remote command. Interactive shell exit codes are
+        // not actionable, but read-only mode uses a non-zero status to report
+        // a missing target session.
+        return if read_only {
+            ConnectionOutcome::RemoteFailure
+        } else {
+            ConnectionOutcome::Complete
+        };
+    }
+
+    // No exit code at all: ssh was terminated by a signal. Someone hanging up
+    // is done; anything else is a crash the reconnect loop should absorb.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        return match status.signal() {
+            Some(libc::SIGINT | libc::SIGTERM | libc::SIGHUP) => ConnectionOutcome::UserTerminated,
+            Some(_) | None => ConnectionOutcome::Reconnect,
+        };
+    }
+
+    #[cfg(not(unix))]
+    ConnectionOutcome::Reconnect
 }
 
 const MOSH_SERVER_BOOTSTRAP: &str = "\
@@ -279,9 +309,7 @@ where
         let (outcome, elapsed) = run(first)?;
         let post_spawn_error = match outcome {
             SshRun::Exited(status) => match connection_outcome(status, read_only) {
-                // Interactive shell exit codes are not actionable, but read-only
-                // mode uses a non-zero status to report a missing target session.
-                ConnectionOutcome::Complete => return Ok(()),
+                ConnectionOutcome::Complete | ConnectionOutcome::UserTerminated => return Ok(()),
                 ConnectionOutcome::RemoteFailure => {
                     anyhow::bail!("read-only connection to {alias} failed with {status}");
                 }
@@ -711,6 +739,13 @@ mod tests {
         ExitStatus::from_raw(code << 8)
     }
 
+    #[cfg(unix)]
+    fn signaled(signal: i32) -> ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+
+        ExitStatus::from_raw(signal)
+    }
+
     fn policy() -> ReconnectPolicy {
         ReconnectPolicy {
             enabled: true,
@@ -865,11 +900,78 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn retries_ssh_crashes() {
+        for signal in [libc::SIGKILL, libc::SIGSEGV, libc::SIGABRT] {
+            assert!(matches!(
+                connection_outcome(signaled(signal), false),
+                ConnectionOutcome::Reconnect
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn read_only_remote_failure_is_preserved() {
         assert_eq!(
             connection_outcome(exit_status(1), true),
             ConnectionOutcome::RemoteFailure
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_termination_signals_do_not_reconnect() {
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+            assert!(matches!(
+                connection_outcome(signaled(signal), false),
+                ConnectionOutcome::UserTerminated
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signaled_ssh_uses_the_reconnect_budget() {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        supervise_ssh(
+            "host",
+            policy(),
+            false,
+            |_| {
+                calls += 1;
+                let status = if calls == 1 {
+                    signaled(libc::SIGKILL)
+                } else {
+                    exit_status(0)
+                };
+                Ok((SshRun::Exited(status), Duration::ZERO))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(delays, [Duration::from_secs(1)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_terminated_ssh_stops_without_backoff() {
+        let mut calls = 0;
+        let mut delays = Vec::new();
+        supervise_ssh(
+            "host",
+            policy(),
+            false,
+            |_| {
+                calls += 1;
+                Ok((SshRun::Exited(signaled(libc::SIGINT)), Duration::ZERO))
+            },
+            |delay| delays.push(delay),
+        )
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert!(delays.is_empty());
     }
 
     #[cfg(unix)]
