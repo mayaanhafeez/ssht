@@ -28,6 +28,25 @@ use crate::vault::{self, LazyVault};
 /// the *remote command's* exit status, which must not be treated as a transport
 /// problem.
 const SSH_FAILURE: i32 = 255;
+const SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
+const SERVER_ALIVE_COUNT_MAX: u32 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionOutcome {
+    Complete,
+    Reconnect,
+    RemoteFailure,
+}
+
+fn connection_outcome(status: ExitStatus, read_only: bool) -> ConnectionOutcome {
+    if status.success() || (!read_only && status.code() != Some(SSH_FAILURE)) {
+        ConnectionOutcome::Complete
+    } else if status.code() == Some(SSH_FAILURE) {
+        ConnectionOutcome::Reconnect
+    } else {
+        ConnectionOutcome::RemoteFailure
+    }
+}
 
 const MOSH_SERVER_BOOTSTRAP: &str = "\
 if command -v mosh-server >/dev/null 2>&1; then exit 0; fi; \
@@ -223,6 +242,7 @@ pub fn connect(
     supervise_ssh(
         alias,
         policy,
+        opts.read_only,
         |first| {
             let started = Instant::now();
             let remote = if first { &first_attach } else { &reattach };
@@ -242,7 +262,13 @@ pub fn connect(
     )
 }
 
-fn supervise_ssh<R, S>(alias: &str, policy: ReconnectPolicy, mut run: R, mut sleep: S) -> Result<()>
+fn supervise_ssh<R, S>(
+    alias: &str,
+    policy: ReconnectPolicy,
+    read_only: bool,
+    mut run: R,
+    mut sleep: S,
+) -> Result<()>
 where
     R: FnMut(bool) -> Result<(SshRun, Duration)>,
     S: FnMut(Duration),
@@ -252,10 +278,15 @@ where
     loop {
         let (outcome, elapsed) = run(first)?;
         let post_spawn_error = match outcome {
-            SshRun::Exited(status) if status.success() || status.code() != Some(SSH_FAILURE) => {
-                return Ok(());
-            }
-            SshRun::Exited(_) => None,
+            SshRun::Exited(status) => match connection_outcome(status, read_only) {
+                // Interactive shell exit codes are not actionable, but read-only
+                // mode uses a non-zero status to report a missing target session.
+                ConnectionOutcome::Complete => return Ok(()),
+                ConnectionOutcome::RemoteFailure => {
+                    anyhow::bail!("read-only connection to {alias} failed with {status}");
+                }
+                ConnectionOutcome::Reconnect => None,
+            },
             SshRun::FailedAfterSpawn(error) => Some(error),
         };
 
@@ -394,29 +425,18 @@ fn run_ssh(
     remote: &str,
     local_echo: bool,
 ) -> Result<SshRun> {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-t");
-    // Become the control master, so `ssht cp` to this host reuses the
-    // connection instead of opening (and authenticating) a second one. Re-set
-    // on each attempt so a reconnect re-establishes the master too.
-    cmd.args(mux_args);
-    // Forwards are rebuilt on every attempt, which is what re-establishes them
-    // after a drop. They go on before user passthrough, so an explicit
-    // `-- -L ...` still has the last word if ssh sees a conflicting bind.
-    cmd.args(forward_args);
-    cmd.args(ssh_passthrough);
+    let mut cmd = ssh_command(
+        target,
+        username,
+        mux_args,
+        forward_args,
+        ssh_passthrough,
+        remote,
+    );
 
     let _askpass_cleanup = password
         .map(|password| vault::setup_ssh_askpass(&mut cmd, password))
         .transpose()?;
-
-    if let Some(user) = username {
-        cmd.arg("-l");
-        cmd.arg(user);
-    }
-
-    cmd.arg(target);
-    cmd.arg(remote);
 
     #[cfg(unix)]
     if local_echo && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
@@ -430,6 +450,44 @@ fn run_ssh(
     cmd.status()
         .map(SshRun::Exited)
         .with_context(|| format!("launching ssh to {target} (is ssh installed?)"))
+}
+
+fn ssh_command(
+    target: &str,
+    username: Option<&str>,
+    mux_args: &[String],
+    forward_args: &[String],
+    ssh_passthrough: &[String],
+    remote: &str,
+) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-t");
+    // Become the control master, so `ssht cp` to this host reuses the
+    // connection instead of opening (and authenticating) a second one. Re-set
+    // on each attempt so a reconnect re-establishes the master too.
+    cmd.args(mux_args);
+    // Forwards are rebuilt on every attempt, which is what re-establishes them
+    // after a drop. They go on before user passthrough, so an explicit
+    // `-- -L ...` still has the last word if ssh sees a conflicting bind.
+    cmd.args(forward_args);
+    // Detect half-open links so ssh exits and the reconnect loop can take over.
+    // User passthrough follows these defaults and can override either option.
+    cmd.args([
+        "-o",
+        &format!("ServerAliveInterval={SERVER_ALIVE_INTERVAL_SECS}"),
+        "-o",
+        &format!("ServerAliveCountMax={SERVER_ALIVE_COUNT_MAX}"),
+    ]);
+    cmd.args(ssh_passthrough);
+
+    if let Some(user) = username {
+        cmd.arg("-l");
+        cmd.arg(user);
+    }
+
+    cmd.arg(target);
+    cmd.arg(remote);
+    cmd
 }
 
 /// Run ssh behind a local PTY so its terminal behavior remains unchanged while
@@ -708,6 +766,7 @@ mod tests {
         supervise_ssh(
             "host",
             policy(),
+            false,
             |first| {
                 first_flags.push(first);
                 Ok((
@@ -724,12 +783,22 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn interactive_remote_failure_completes_the_session() {
+        assert_eq!(
+            connection_outcome(exit_status(1), false),
+            ConnectionOutcome::Complete
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn retries_failures_after_ssh_has_spawned() {
         let mut calls = 0;
         let mut delays = Vec::new();
         supervise_ssh(
             "host",
             policy(),
+            false,
             |_| {
                 calls += 1;
                 let outcome = if calls == 1 {
@@ -753,6 +822,7 @@ mod tests {
         let error = supervise_ssh(
             "host",
             policy(),
+            false,
             |_| {
                 calls += 1;
                 anyhow::bail!("ssh executable not found")
@@ -774,6 +844,7 @@ mod tests {
         let error = supervise_ssh(
             "host",
             p,
+            false,
             |_| {
                 calls += 1;
                 Ok((
@@ -792,6 +863,28 @@ mod tests {
         assert!(format!("{error:#}").contains("relay failed"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_only_remote_failure_is_preserved() {
+        assert_eq!(
+            connection_outcome(exit_status(1), true),
+            ConnectionOutcome::RemoteFailure
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ssh_failure_reconnects_in_both_modes() {
+        assert_eq!(
+            connection_outcome(exit_status(SSH_FAILURE), false),
+            ConnectionOutcome::Reconnect
+        );
+        assert_eq!(
+            connection_outcome(exit_status(SSH_FAILURE), true),
+            ConnectionOutcome::Reconnect
+        );
+    }
+
     #[test]
     fn mosh_ssh_command_preserves_argument_boundaries() {
         let mux = vec!["-o".into(), "ProxyCommand=jump host".into()];
@@ -800,6 +893,66 @@ mod tests {
             mosh_ssh_command(Some("dev user"), &mux, &passthrough),
             "'ssh' '-o' 'ProxyCommand=jump host' '-p' '2222' '-l' 'dev user'"
         );
+    }
+
+    #[test]
+    fn interactive_ssh_uses_heartbeat_defaults() {
+        let cmd = ssh_command("host", None, &[], &[], &[], "remote");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "ServerAliveInterval=15"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "ServerAliveCountMax=3"]));
+    }
+
+    #[test]
+    fn passthrough_can_override_heartbeat_defaults() {
+        let passthrough = vec!["-o".into(), "ServerAliveInterval=5".into()];
+        let cmd = ssh_command("host", None, &[], &[], &passthrough, "remote");
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let default = args
+            .iter()
+            .position(|arg| arg == "ServerAliveInterval=15")
+            .unwrap();
+        let override_arg = args
+            .iter()
+            .position(|arg| arg == "ServerAliveInterval=5")
+            .unwrap();
+        assert!(default < override_arg);
+    }
+
+    #[test]
+    fn interactive_ssh_command_preserves_all_arguments() {
+        let mux = vec!["-o".into(), "ControlMaster=auto".into()];
+        let forwards = vec!["-L".into(), "8080:localhost:80".into()];
+        let passthrough = vec!["-p".into(), "2222".into()];
+        let cmd = ssh_command(
+            "example.com",
+            Some("deploy"),
+            &mux,
+            &forwards,
+            &passthrough,
+            "tmux attach",
+        );
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args.first().map(String::as_str), Some("-t"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-L", "8080:localhost:80"]));
+        assert!(args.windows(2).any(|pair| pair == ["-p", "2222"]));
+        assert!(args.windows(2).any(|pair| pair == ["-l", "deploy"]));
+        assert_eq!(args[args.len() - 2..], ["example.com", "tmux attach"]);
     }
 
     #[test]
