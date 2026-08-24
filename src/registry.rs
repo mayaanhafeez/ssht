@@ -17,12 +17,14 @@ use crate::vault::{self, LazyVault};
 pub struct SessionInfo {
     pub name: String,
     pub windows: u32,
-    pub attached: bool,
+    pub clients: u32,
 }
 
-/// Tab-separated, one line per session. Explicit format rather than parsing
-/// tmux's human-readable default, which varies across versions.
-const LIST_FORMAT: &str = "#{session_name}\t#{session_windows}\t#{session_attached}";
+/// Explicit delimiter rather than a tab, which tmux can rewrite when invoked
+/// through a non-interactive SSH exec channel.
+const LIST_DELIMITER: &str = "__SSHT_FIELD__";
+const LIST_FORMAT: &str =
+    "#{session_name}__SSHT_FIELD__#{session_windows}__SSHT_FIELD__#{session_attached}";
 
 /// Parse `tmux ls -F` output. Malformed lines are skipped rather than failing
 /// the whole listing — a session with a tab in its name shouldn't hide the rest.
@@ -30,17 +32,18 @@ fn parse_sessions(stdout: &str) -> Vec<SessionInfo> {
     stdout
         .lines()
         .filter_map(|line| {
-            let mut fields = line.split('\t');
-            let name = fields.next()?.trim();
+            let (name, clients) = line.rsplit_once(LIST_DELIMITER)?;
+            let (name, windows) = name.rsplit_once(LIST_DELIMITER)?;
+            let name = name.trim();
             if name.is_empty() {
                 return None;
             }
-            let windows = fields.next()?.trim().parse().ok()?;
-            let attached = fields.next()?.trim() != "0";
+            let windows = windows.trim().parse().ok()?;
+            let clients = clients.trim().parse().ok()?;
             Some(SessionInfo {
                 name: name.to_string(),
                 windows,
-                attached,
+                clients,
             })
         })
         .collect()
@@ -111,11 +114,7 @@ pub fn kill(alias: &str, session: &str, vault: &mut LazyVault) -> Result<()> {
 
 /// Rename a tmux session on `alias`.
 pub fn rename(alias: &str, from: &str, to: &str, vault: &mut LazyVault) -> Result<()> {
-    let remote = format!(
-        "tmux rename-session -t {} {}",
-        sh_quote(from),
-        sh_quote(to)
-    );
+    let remote = format!("tmux rename-session -t {} {}", sh_quote(from), sh_quote(to));
     let out = run_remote(alias, vault, &remote)?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -130,12 +129,20 @@ mod tests {
 
     #[test]
     fn parses_listing() {
-        let out = "main\t3\t1\nbuild\t1\t0\n";
+        let out = "main__SSHT_FIELD__3__SSHT_FIELD__1\nbuild__SSHT_FIELD__1__SSHT_FIELD__0\n";
         assert_eq!(
             parse_sessions(out),
             vec![
-                SessionInfo { name: "main".into(), windows: 3, attached: true },
-                SessionInfo { name: "build".into(), windows: 1, attached: false },
+                SessionInfo {
+                    name: "main".into(),
+                    windows: 3,
+                    clients: 1
+                },
+                SessionInfo {
+                    name: "build".into(),
+                    windows: 1,
+                    clients: 0
+                },
             ]
         );
     }
@@ -148,7 +155,7 @@ mod tests {
 
     #[test]
     fn skips_malformed_lines_but_keeps_the_rest() {
-        let out = "main\t3\t1\ngarbage\nbuild\tnotanumber\t0\nlogs\t2\t0\n";
+        let out = "main__SSHT_FIELD__3__SSHT_FIELD__1\ngarbage\nbuild__SSHT_FIELD__notanumber__SSHT_FIELD__0\nlogs__SSHT_FIELD__2__SSHT_FIELD__0\n";
         let sessions = parse_sessions(out);
         assert_eq!(sessions.len(), 2);
         assert_eq!(sessions[0].name, "main");
@@ -156,9 +163,21 @@ mod tests {
     }
 
     #[test]
-    fn attached_is_any_nonzero_count() {
+    fn preserves_attached_client_count() {
         // tmux reports a client *count*, not a boolean.
-        let sessions = parse_sessions("main\t1\t2\n");
-        assert!(sessions[0].attached);
+        let sessions = parse_sessions("main__SSHT_FIELD__1__SSHT_FIELD__2\n");
+        assert_eq!(sessions[0].clients, 2);
+    }
+
+    #[test]
+    fn does_not_depend_on_tabs_surviving_tmux() {
+        assert!(!LIST_FORMAT.contains('\t'));
+        assert_eq!(parse_sessions("main_1_1\n"), Vec::new());
+    }
+
+    #[test]
+    fn delimiter_in_session_name_is_preserved() {
+        let sessions = parse_sessions("main__SSHT_FIELD__archive__SSHT_FIELD__1__SSHT_FIELD__0\n");
+        assert_eq!(sessions[0].name, "main__SSHT_FIELD__archive");
     }
 }
