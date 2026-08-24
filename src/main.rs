@@ -226,13 +226,13 @@ fn cmd_sessions(host: &str, vault: &mut LazyVault) -> Result<()> {
         eprintln!("No tmux sessions running on {host}");
         return Ok(());
     }
-    println!("{:<24} {:>7}  {}", "SESSION", "WINDOWS", "ATTACHED");
+    println!("{:<24} {:>7}  {}", "SESSION", "WINDOWS", "CLIENTS");
     for s in &sessions {
         println!(
             "{:<24} {:>7}  {}",
             s.name,
             s.windows,
-            if s.attached { "yes" } else { "no" }
+            s.clients
         );
     }
     Ok(())

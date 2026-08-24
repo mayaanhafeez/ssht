@@ -17,7 +17,7 @@ use crate::vault::{self, LazyVault};
 pub struct SessionInfo {
     pub name: String,
     pub windows: u32,
-    pub attached: bool,
+    pub clients: u32,
 }
 
 /// Explicit delimiter rather than a tab, which tmux can rewrite when invoked
@@ -32,18 +32,18 @@ fn parse_sessions(stdout: &str) -> Vec<SessionInfo> {
     stdout
         .lines()
         .filter_map(|line| {
-            let (name, attached) = line.rsplit_once(LIST_DELIMITER)?;
+            let (name, clients) = line.rsplit_once(LIST_DELIMITER)?;
             let (name, windows) = name.rsplit_once(LIST_DELIMITER)?;
             let name = name.trim();
             if name.is_empty() {
                 return None;
             }
             let windows = windows.trim().parse().ok()?;
-            let attached = attached.trim() != "0";
+            let clients = clients.trim().parse().ok()?;
             Some(SessionInfo {
                 name: name.to_string(),
                 windows,
-                attached,
+                clients,
             })
         })
         .collect()
@@ -136,12 +136,12 @@ mod tests {
                 SessionInfo {
                     name: "main".into(),
                     windows: 3,
-                    attached: true
+                    clients: 1
                 },
                 SessionInfo {
                     name: "build".into(),
                     windows: 1,
-                    attached: false
+                    clients: 0
                 },
             ]
         );
@@ -163,10 +163,10 @@ mod tests {
     }
 
     #[test]
-    fn attached_is_any_nonzero_count() {
+    fn preserves_attached_client_count() {
         // tmux reports a client *count*, not a boolean.
         let sessions = parse_sessions("main__SSHT_FIELD__1__SSHT_FIELD__2\n");
-        assert!(sessions[0].attached);
+        assert_eq!(sessions[0].clients, 2);
     }
 
     #[test]
