@@ -4,15 +4,28 @@ on:
   push:
     tags:
       - "v*.*.*"
+  # Manual re-run, for backfilling assets onto a release whose build never
+  # fired. Dispatch from main; the jobs check out the tag named below.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build packages for (e.g. v0.1.5)"
+        required: true
 
 permissions:
   contents: write
+
+env:
+  # A tag push supplies this via the ref; a manual re-run supplies it as input.
+  TAG: ${{ inputs.tag || github.ref_name }}
 
 jobs:
   deb:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -27,12 +40,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tag_name: ${{ env.TAG }}
           files: target/debian/*.deb
 
   rpm:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -50,6 +66,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tag_name: ${{ env.TAG }}
           files: target/generate-rpm/*.rpm
 
   pacman:
@@ -58,13 +75,15 @@ jobs:
       image: archlinux:base-devel
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
 
       - name: Install build dependencies
         run: pacman -Syu --noconfirm --needed rust openssh
 
       - name: Set package version from tag
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${TAG#v}"
           sed -i "s/^pkgver=.*/pkgver=${version}/" PKGBUILD
 
       - name: Build package as non-root user
@@ -78,4 +97,5 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
+          tag_name: ${{ env.TAG }}
           files: "*.pkg.tar.zst"

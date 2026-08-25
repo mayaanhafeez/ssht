@@ -105,6 +105,12 @@ jobs:
           NEXT: ${{ steps.version.outputs.next }}
         run: |
           set -euo pipefail
+          # actions/checkout persists a GITHUB_TOKEN Authorization header in
+          # .git/config, and that header wins over the credentials in the push
+          # URL below. Left in place it silently makes this a GITHUB_TOKEN
+          # push, which GitHub refuses to raise events for — so release.yml
+          # never fires. Drop it so the PAT below is what actually authenticates.
+          git config --unset-all http.https://github.com/.extraheader || true
           git tag -a "v${NEXT}" -m "v${NEXT}"
           # PAT on purpose: this tag must trigger release.yml's package builds.
           git push \
