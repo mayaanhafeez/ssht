@@ -6,7 +6,12 @@ name: Auto Release
 # Loop safety: the version-bump commit is pushed back to main using
 # GITHUB_TOKEN. GitHub deliberately does not trigger workflow runs for pushes
 # made with GITHUB_TOKEN, so that commit cannot re-enter this workflow. The
-# `[skip ci]` marker and the `if:` guard below are belt-and-braces on top.
+# `[auto-release]` marker and the `if:` guard below are belt-and-braces on top.
+#
+# That marker is deliberately NOT `[skip ci]`: the tag we push points at
+# the bump commit, and GitHub treats `[skip ci]` in a pushed commit's
+# message as a reserved keyword that discards the run outright — which
+# silently stopped release.yml from ever building packages.
 #
 # The *tag*, by contrast, is pushed with RELEASE_TOKEN (a PAT) precisely
 # because it must trigger something: release.yml listens on `v*.*.*` and
@@ -26,7 +31,7 @@ permissions:
 
 jobs:
   release:
-    if: "!contains(github.event.head_commit.message, '[skip ci]')"
+    if: "!contains(github.event.head_commit.message, '[auto-release]')"
     runs-on: ubuntu-latest
     env:
       # Job-level so the `if:` guards below can see it. Empty when the secret
@@ -94,7 +99,7 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock PKGBUILD
-          git commit -m "Bump version to ${NEXT} [skip ci]"
+          git commit -m "Bump version to ${NEXT} [auto-release]"
           # Pushed with the default GITHUB_TOKEN checkout credential, so this
           # does not retrigger this workflow.
           git push origin HEAD:main
